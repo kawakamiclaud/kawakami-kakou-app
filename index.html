@@ -8,29 +8,33 @@
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:"Yu Gothic","Meiryo",sans-serif;background:#F5F7FA;color:#333;font-size:13px}
-header{background:#1F4E79;color:#fff;padding:10px 20px;display:flex;justify-content:space-between;align-items:center}
+header{background:#C2410C;color:#fff;padding:10px 20px;display:flex;justify-content:space-between;align-items:center}
 header h1{font-size:16px}
 header .actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-header button{background:#fff;color:#1F4E79;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold}
+header button{background:#fff;color:#C2410C;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold}
 header .badge-sync{background:#1E7D34;color:#fff;padding:4px 10px;border-radius:4px;font-size:11px}
-header .badge-backend{background:#0B5FA5;color:#fff;padding:4px 10px;border-radius:4px;font-size:11px}
+header .badge-backend{background:#7C2D12;color:#fff;padding:4px 10px;border-radius:4px;font-size:11px}
 header .btn-disc{background:#DC3545;color:#fff}
 header .btn-reset{background:#DC3545;color:#fff}
-nav{background:#fff;padding:0 20px;display:flex;gap:0;border-bottom:2px solid #1F4E79;overflow-x:auto}
+nav{background:#fff;padding:0 20px;display:flex;gap:0;border-bottom:2px solid #C2410C;overflow-x:auto}
 nav button{background:none;border:none;padding:12px 16px;cursor:pointer;font-size:13px;color:#666;border-bottom:3px solid transparent;white-space:nowrap}
-nav button.active{color:#1F4E79;font-weight:bold;border-bottom-color:#1F4E79}
+/* 選択中タブは文字を黒にし、下線のオレンジで現在地を示す。
+   太字＋オレンジ下線があるので、未選択タブ(#666・標準太さ)との区別は付く。 */
+nav button.active{color:#222;font-weight:bold;border-bottom-color:#C2410C}
 main{padding:16px;max-width:1600px;margin:0 auto}
 .card{background:#fff;border-radius:8px;padding:16px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,0.1)}
-.card h2{color:#1F4E79;font-size:15px;margin-bottom:12px;padding-bottom:6px;border-bottom:1px solid #EEE}
+.card h2{color:#222;font-size:15px;margin-bottom:12px;padding-bottom:6px;border-bottom:1px solid #EEE}
 table{width:100%;border-collapse:collapse;font-size:12px}
-th{background:#1F4E79;color:#fff;padding:8px;text-align:left;font-weight:bold}
+th{background:#C2410C;color:#fff;padding:8px;text-align:left;font-weight:bold}
 td{padding:6px 8px;border-bottom:1px solid #EEE;vertical-align:middle}
 tr:hover{background:#F9FAFB}
 input,select,textarea{padding:6px 8px;border:1px solid #DDD;border-radius:4px;font-size:12px;font-family:inherit}
-input:focus,select:focus{outline:none;border-color:#1F4E79}
+input:focus,select:focus{outline:none;border-color:#C2410C}
 .btn{padding:6px 12px;border:none;border-radius:4px;font-size:12px;font-weight:bold;cursor:pointer}
-.btn-primary{background:#1F4E79;color:#fff}
-.btn-secondary{background:#DDE6F0;color:#1F4E79}
+.btn-primary{background:#C2410C;color:#fff}
+/* 副ボタンは淡いオレンジにすると「停止中」バッジ(#FCE4D6)と見分けがつかなくなるため、
+   背景は無彩色のグレー、文字だけ濃いオレンジにしてテーマと揃える。 */
+.btn-secondary{background:#E8EAED;color:#333}
 .btn-danger{background:#DC3545;color:#fff}
 .btn-success{background:#1E7D34;color:#fff}
 .btn-sm{padding:3px 8px;font-size:11px}
@@ -40,7 +44,9 @@ input:focus,select:focus{outline:none;border-color:#1F4E79}
 .grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
 .grid-4{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px}
 .stat{text-align:center;padding:14px;background:#F5F7FA;border-radius:6px}
-.stat .value{font-size:22px;font-weight:bold;color:#1F4E79}
+/* 金額や集計値は「読む文字」なので黒。オレンジは背景・枠にだけ使う。
+   数値をテーマ色にすると全部が強調されて見え、かえって読みにくくなる。 */
+.stat .value{font-size:22px;font-weight:bold;color:#222}
 .stat .label{font-size:11px;color:#666;margin-top:4px}
 .badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:bold}
 .badge-created{background:#FFF2CC;color:#8B7500}
@@ -56,13 +62,13 @@ input:focus,select:focus{outline:none;border-color:#1F4E79}
 .search input{width:100%;padding:7px 10px}
 .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:100}
 .modal{background:#fff;border-radius:8px;padding:20px;width:1100px;max-width:97vw;max-height:92vh;overflow:auto}
-.modal h3{color:#1F4E79;margin-bottom:12px}
+.modal h3{color:#222;margin-bottom:12px}
 .form-row{margin-bottom:10px}
 .form-row label{display:block;margin-bottom:3px;font-size:11px;color:#555;font-weight:bold}
 .form-row input,.form-row select,.form-row textarea{width:100%}
 .text-right{text-align:right}
 .text-center{text-align:center}
-.price{color:#1F4E79;font-weight:bold}
+.price{color:#222;font-weight:bold}
 .profit{color:#1E7D34;font-weight:bold}
 .loss{color:#DC3545;font-weight:bold}
 .toast{position:fixed;top:60px;right:20px;background:#1E7D34;color:#fff;padding:10px 16px;border-radius:6px;z-index:200;box-shadow:0 4px 12px rgba(0,0,0,0.2)}
@@ -72,7 +78,7 @@ input:focus,select:focus{outline:none;border-color:#1F4E79}
 .summary-box{background:#FFF2CC;padding:10px;border-radius:6px;margin-top:10px;display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
 .summary-box .item{text-align:center}
 .summary-box .item .lbl{font-size:10px;color:#666}
-.summary-box .item .val{font-size:16px;font-weight:bold;color:#1F4E79;margin-top:2px}
+.summary-box .item .val{font-size:16px;font-weight:bold;color:#222;margin-top:2px}
 /* ---- Phase D: 帳票印刷(見積書/発注書/納品書) 用レイアウト ---- */
 .print-page-wrap{position:fixed;inset:0;background:#fff;z-index:300;overflow:auto;padding:20px 0}
 .print-page{width:210mm;min-height:297mm;margin:0 auto 20px;background:#fff;padding:15mm;box-shadow:0 2px 10px rgba(0,0,0,0.15);font-size:12px;color:#222}
@@ -1868,7 +1874,11 @@ function TransactionModal({record,data,update,onSave,onClose}){
         <h3>取引 {r.id?"編集":"新規登録"} {r.transactionNo?`(${r.transactionNo})`:""} {isLocked && <span className="badge badge-invoiced">請求済(編集不可)</span>}</h3>
         {customerSuspended && <div style={{background:"#FCE4D6",color:"#C05621",padding:8,borderRadius:4,marginBottom:8,fontSize:11}}>⚠ このお客様は取引停止/無効中です。取引内容を確認してください。</div>}
         <div className="grid-4">
-          <div className="form-row"><label>受注日(取引日) *</label><input type="date" value={r.transactionDate||""} onChange={e=>{set("transactionDate",e.target.value);set("orderDate",e.target.value);}} disabled={isLocked}/></div>
+          {/* setは古いrを展開する実装(setR({...r,[k]:v}))なので、1回の操作でsetを2回呼ぶと
+              後の呼び出しが前の変更を消してしまう。ここで2回呼ぶと transactionDate が
+              orderDate の更新に打ち消され、日付を変えても元に戻る(=遡って入力できない)。
+              取引日と受注日は必ず1回のsetRで同時に書き換えること。 */}
+          <div className="form-row"><label>受注日(取引日) *</label><input type="date" value={r.transactionDate||""} onChange={e=>setR({...r, transactionDate:e.target.value, orderDate:e.target.value})} disabled={isLocked}/></div>
           <div className="form-row"><label>お客様 (受注先) *</label>
             <select value={r.customerId||""} onChange={e=>set("customerId",e.target.value)} disabled={isLocked}>
               <option value="">選択...</option>
@@ -3164,7 +3174,7 @@ function StockSummarySection({data}){
               <td>{r.product.name}</td><td>{r.warehouse.name}</td>
               <td className="text-right">{r.onHand}</td>
               <td className="text-right">{r.allocated}</td>
-              <td className="text-right" style={{fontWeight:"bold",color:r.available<0?"#DC3545":"#1F4E79"}}>{r.available}</td>
+              <td className="text-right" style={{fontWeight:"bold",color:r.available<0?"#DC3545":"#222"}}>{r.available}</td>
               <td className="text-right">-</td>
               <td className="text-right">-</td>
               <td className="text-right" style={{color:r.expiredQty>0?"#DC3545":undefined}}>{r.product.lotManaged?r.expiredQty:"-"}</td>
