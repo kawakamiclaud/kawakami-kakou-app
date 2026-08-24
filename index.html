@@ -157,7 +157,7 @@ const INITIAL_DATA = {
   "freeeErrorLog": []
 };
 
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 12;
 
 // 旧データ(v1)を新形式(v2/v3/v4/v5/v6/v7/v8)へ移行する。既存フィールドの欠損補完のみ行い、
 // 既にある値は絶対に上書きしない。v1→v8を1回のmigrateData()呼び出しで
@@ -367,6 +367,19 @@ function migrateData(raw) {
     ...s,
     freightAmount: s.freightAmount ?? 0,
     freightInvoicedAt: s.freightInvoicedAt ?? null,
+  }));
+  // ---- v12マイグレーション: 運賃マスタ(運送会社×納品先)の追加 ----
+  // 運賃は「どの運送会社で、どの納品先へ運ぶか」で決まるため、その組み合わせごとに単価を持つ。
+  // rateTypeは perCase(1ケースあたり×ケース数) と flat(1回の出荷につき定額) の2種類。
+  // 運送会社は取引先マスタに isCarrier フラグを立てて表す(加工委託先のisProcessorと同じ考え方)。
+  // 既存データは運賃マスタが空・運送会社フラグ無しで始まるので、従来の動作は一切変わらない。
+  if (fromVersion < 12) d.meta.migratedAtV12 = new Date().toISOString();
+  d.freightRates = d.freightRates || [];
+  d.partners = (d.partners || []).map(p => ({...p, isCarrier: p.isCarrier ?? false}));
+  d.shipments = (d.shipments || []).map(s => ({
+    ...s,
+    freightSeparate: s.freightSeparate ?? (Number(s.freightAmount||0) > 0),
+    carrierId: s.carrierId ?? null,
   }));
   d.meta.schemaVersion = SCHEMA_VERSION;
   d.meta.appKey = APP_KEY;
@@ -650,6 +663,7 @@ const AUDIT_TARGET_TYPE_LABELS = {
   quotation: "見積",
   shipment: "出荷/納品",
   deliveryDestination: "納品先",
+  freightRate: "運賃マスタ",
   document: "帳票(見積書/発注書/納品書)",
   companySettings: "自社設定(帳票用)",
   warehouse: "倉庫",
@@ -682,6 +696,45 @@ function findPrice(prices, partnerId, productId, sanchi, date, priceType) {
   );
   matched.sort((a,b) => new Date(b.startDate) - new Date(a.startDate));
   return matched[0] || null;
+}
+
+// ================================================================
+// 運賃マスタ(運送会社×納品先) 共通ヘルパー
+// ================================================================
+// 運賃は「どの運送会社で、どの納品先へ運ぶか」の組み合わせで決まる。
+// 単価マスタ(findPrice)と同じく適用期間を持ち、日付に該当する行のうち開始日が最も新しいものを採用する。
+function findFreightRate(freightRates, carrierId, destinationId, date) {
+  if (!carrierId || !destinationId) return null;
+  const dt = new Date(date || today());
+  const matched = (freightRates||[]).filter(r =>
+    r.carrierId === carrierId &&
+    r.destinationId === destinationId &&
+    new Date(r.startDate) <= dt &&
+    (!r.endDate || new Date(r.endDate) >= dt)
+  );
+  matched.sort((a,b) => new Date(b.startDate) - new Date(a.startDate));
+  return matched[0] || null;
+}
+// 運賃額を計算する。perCase(1ケースあたり)はケース数を掛け、flat(定額)はそのまま。
+// ケース数が0でも定額運賃は発生しうるため、rateTypeごとに分けて扱う。
+function calcFreightAmount(rate, caseQty) {
+  if (!rate) return null;
+  if (rate.rateType === "flat") return Number(rate.unitPrice||0);
+  return Math.round(Number(rate.unitPrice||0) * Number(caseQty||0));
+}
+// 同一の運送会社×納品先で適用期間が重なる運賃を探す(単価マスタのfindOverlappingPriceと同じ役割)
+function findOverlappingFreightRate(freightRates, r) {
+  const s = new Date(r.startDate);
+  const e = r.endDate ? new Date(r.endDate) : null;
+  return (freightRates||[]).find(x => {
+    if (r.id && x.id === r.id) return false;
+    if (x.carrierId !== r.carrierId || x.destinationId !== r.destinationId) return false;
+    const xs = new Date(x.startDate);
+    const xe = x.endDate ? new Date(x.endDate) : null;
+    if (e && xs > e) return false;
+    if (xe && xe < s) return false;
+    return true;
+  }) || null;
 }
 
 // ================================================================
@@ -881,10 +934,10 @@ const supportsFSA = typeof window !== "undefined" && "showSaveFilePicker" in win
 // ================================================================
 const BACKEND_CONFIG_KEY = "backend_config_kakou_v3";  // 肥料農薬アプリと衝突しないようアプリ固有のキーにする
 // pullAllのレスポンス/pushの対象となる14種類の配列名。data直下のキー名とAPI側entity名は完全一致。
-const BACKEND_ENTITIES = ["products","partners","prices","transactions","quotations","deliveryDestinations","shipments","documents","warehouses","inventoryMovements","lots","allocations","payments","processingOrders","auditLog"];
+const BACKEND_ENTITIES = ["products","partners","prices","freightRates","transactions","quotations","deliveryDestinations","shipments","documents","warehouses","inventoryMovements","lots","allocations","payments","processingOrders","auditLog"];
 const BACKEND_ENTITY_LABELS = {
   products:"商品", partners:"取引先", prices:"単価", transactions:"取引",
-  quotations:"見積", deliveryDestinations:"納品先", shipments:"出荷", documents:"帳票",
+  quotations:"見積", deliveryDestinations:"納品先", shipments:"出荷", documents:"帳票", freightRates:"運賃",
   warehouses:"倉庫", inventoryMovements:"入出庫履歴", lots:"ロット", allocations:"在庫引当",
   payments:"入金", processingOrders:"加工委託", auditLog:"操作履歴",
 };
@@ -1365,6 +1418,7 @@ function App(){
     ["products","商品マスタ"],
     ["partners","取引先マスタ"],
     ["prices","単価マスタ"],
+    ["freightrates","運賃マスタ"],
     ["auditlog","操作履歴"],
     ["settings","設定"],
   ];
@@ -1425,6 +1479,7 @@ function App(){
       {tab==="products" && <ProductsTab data={data} update={update}/>}
       {tab==="partners" && <PartnersTab data={data} update={update}/>}
       {tab==="prices" && <PricesTab data={data} update={update}/>}
+      {tab==="freightrates" && <FreightRatesTab data={data} update={update}/>}
       {tab==="auditlog" && <AuditLogTab data={data}/>}
       {tab==="settings" && <SettingsTab data={data} update={update} backendConfig={backendConfig} onSaveBackendConfig={saveBackendConfig} lastSyncTime={lastSyncTime} showToast={showToast}/>}
     </main>
@@ -2204,7 +2259,8 @@ function ShipmentEntryModal({transaction,data,update,onClose}){
   const [header,setHeader] = useState({
     shipmentDate: today(), plannedDeliveryDate: tx.plannedDeliveryDate||"", actualDeliveryDate:"",
     originBase: tx.sanchi||"熊本", deliveryDestinationId: tx.deliveryDestinationId||"",
-    carrier:"", trackingNo:"", deliveryMethod:"", note:"", freightAmount:"",
+    carrier:"", carrierId:"", trackingNo:"", deliveryMethod:"", note:"",
+    freightSeparate:false, freightAmount:"",
   });
   // 明細ごとの「今回出荷」「今回納品」「今回返品」入力値
   const [qtyInputs,setQtyInputs] = useState(()=>{
@@ -2219,6 +2275,46 @@ function ShipmentEntryModal({transaction,data,update,onClose}){
   const setHeaderField = (k,v) => setHeader({...header,[k]:v});
   const setQty = (itemId,k,v) => setQtyInputs({...qtyInputs,[itemId]:{...qtyInputs[itemId],[k]:v}});
 
+  // ---- 運賃の自動計算(運送会社×納品先の運賃マスタから引く) ----
+  const carriers = (data.partners||[]).filter(p=>p.isCarrier);
+  // 「今回出荷」に入力されている数量の合計。perCase(1ケースあたり)の運賃はこれを掛けて求める。
+  const totalShipQty = Object.values(qtyInputs).reduce((s,q)=>s+(Number(q.ship)||0),0);
+  // headerの現在値から運賃を引き直す純粋な計算(setHeader内で使うため引数で受け取る)
+  const lookupFreight = (carrierId, destinationId, shipDate, qty) => {
+    const rate = findFreightRate(data.freightRates||[], carrierId, destinationId, shipDate);
+    return {rate, amount: calcFreightAmount(rate, qty)};
+  };
+  // 送料別ON・運送会社・納品先が揃った時点で金額を自動で入れる。
+  // 請求済みの運賃は書き換えない(請求書と食い違うため)。
+  const applyFreight = (next) => {
+    if (editingShipment?.freightInvoicedAt) return next;
+    if (!next.freightSeparate) return {...next, freightAmount:""};
+    const {amount} = lookupFreight(next.carrierId, next.deliveryDestinationId, next.shipmentDate, totalShipQty);
+    if (amount == null) return next;           // 該当する運賃が無ければ手入力に任せる
+    return {...next, freightAmount:String(amount)};
+  };
+  const setCarrier = (carrierId) => {
+    const c = carriers.find(x=>x.id===carrierId);
+    // carrier(名称の自由記入欄)は帳票や過去データとの互換のため名前も一緒に持たせる
+    setHeader(applyFreight({...header, carrierId, carrier: c?c.name:""}));
+  };
+  const setFreightSeparate = (on) => setHeader(applyFreight({...header, freightSeparate:on}));
+  // 納品先・出荷日・出荷数量が変わっても運賃を引き直す
+  useEffect(()=>{
+    if (!header.freightSeparate) return;
+    setHeader(h=>applyFreight(h));
+    // eslint-disable-next-line
+  },[header.deliveryDestinationId, header.shipmentDate, totalShipQty]);
+
+  const freightRateNow = findFreightRate(data.freightRates||[], header.carrierId, header.deliveryDestinationId, header.shipmentDate);
+  const freightHint = !header.carrierId || !header.deliveryDestinationId
+    ? "運送会社と納品先を選ぶと、運賃マスタから金額が自動で入ります(未登録なら手入力してください)。"
+    : freightRateNow
+      ? (freightRateNow.rateType==="flat"
+          ? `運賃マスタ: 1回の出荷につき ${yen(freightRateNow.unitPrice)}（定額）`
+          : `運賃マスタ: 1ケース ${yen(freightRateNow.unitPrice)} × 出荷数量 ${totalShipQty} = ${yen(calcFreightAmount(freightRateNow,totalShipQty))}`)
+      : "この運送会社×納品先の運賃は未登録です。金額を手入力するか、運賃マスタに登録してください。";
+
   const startEdit = (s) => {
     setEditingShipment(s);
     setHeader({
@@ -2226,6 +2322,8 @@ function ShipmentEntryModal({transaction,data,update,onClose}){
       actualDeliveryDate: s.actualDeliveryDate||"", originBase: s.originBase||tx.sanchi||"熊本",
       deliveryDestinationId: s.deliveryDestinationId||"", carrier: s.carrier||"", trackingNo: s.trackingNo||"",
       deliveryMethod: s.deliveryMethod||"", note: s.note||"",
+      carrierId: s.carrierId||"",
+      freightSeparate: s.freightSeparate ?? (Number(s.freightAmount||0) > 0),
       freightAmount: Number(s.freightAmount||0) ? String(s.freightAmount) : "",
     });
     const init = {};
@@ -2301,7 +2399,11 @@ function ShipmentEntryModal({transaction,data,update,onClose}){
           actualDeliveryDate: header.actualDeliveryDate||null, originBase: header.originBase||null,
           deliveryDestinationId: header.deliveryDestinationId||null, carrier: header.carrier||"",
           trackingNo: header.trackingNo||"", deliveryMethod: header.deliveryMethod||"", items: shipmentItems,
-          freightAmount: Number(header.freightAmount||0), freightInvoicedAt: null,
+          carrierId: header.carrierId||null,
+          // 送料別のチェックを外した出荷は運賃0として扱う(チェックを外したのに金額が残る事故を防ぐ)
+          freightSeparate: !!header.freightSeparate,
+          freightAmount: header.freightSeparate ? Number(header.freightAmount||0) : 0,
+          freightInvoicedAt: null,
           note: header.note||"", status: "shipped",
           createdBy: d.meta?.currentUserName||"", createdAt: now, updatedBy: d.meta?.currentUserName||"", updatedAt: now,
         };
@@ -2313,10 +2415,14 @@ function ShipmentEntryModal({transaction,data,update,onClose}){
           actualDeliveryDate: header.actualDeliveryDate||null, originBase: header.originBase||null,
           deliveryDestinationId: header.deliveryDestinationId||null, carrier: header.carrier||"",
           trackingNo: header.trackingNo||"", deliveryMethod: header.deliveryMethod||"", items: shipmentItems,
-          // 運賃を既に請求済みの出荷は、金額を書き換えると請求書と食い違うため元の値を守る
+          carrierId: header.carrierId||null,
+          // 運賃を既に請求済みの出荷は、金額も送料別の指定も書き換えない(請求書と食い違うため)
+          freightSeparate: beforeShipment?.freightInvoicedAt
+            ? !!beforeShipment.freightSeparate
+            : !!header.freightSeparate,
           freightAmount: beforeShipment?.freightInvoicedAt
             ? Number(beforeShipment.freightAmount||0)
-            : Number(header.freightAmount||0),
+            : (header.freightSeparate ? Number(header.freightAmount||0) : 0),
           note: header.note||"", updatedBy: d.meta?.currentUserName||"", updatedAt: now,
         };
         d.shipments = d.shipments.map(s=>s.id===editingShipment.id?shipmentRec:s);
@@ -2488,19 +2594,45 @@ function ShipmentEntryModal({transaction,data,update,onClose}){
               {dests.map(dd=><option key={dd.id} value={dd.id}>{dd.name}</option>)}
             </select>
           </div>
-          <div className="form-row"><label>運送業者</label><input value={header.carrier} onChange={e=>setHeaderField("carrier",e.target.value)}/></div>
+          <div className="form-row"><label>運送会社</label>
+            <select value={header.carrierId||""} onChange={e=>setCarrier(e.target.value)}>
+              <option value="">(未指定)</option>
+              {carriers.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+            {carriers.length===0 && <small style={{color:"#B45309",fontSize:10}}>取引先マスタで「運送会社」にチェックを入れてください</small>}
+          </div>
           <div className="form-row"><label>伝票/追跡番号</label><input value={header.trackingNo} onChange={e=>setHeaderField("trackingNo",e.target.value)}/></div>
           <div className="form-row"><label>配送方法</label><input value={header.deliveryMethod} onChange={e=>setHeaderField("deliveryMethod",e.target.value)}/></div>
-          {/* 出荷ごとの運賃(お客様へ別途請求する分)。請求済みの出荷は金額を固定して事故を防ぐ。 */}
-          <div className="form-row"><label>運賃(お客様請求分)</label>
-            <input type="number" min="0" value={header.freightAmount}
-              onChange={e=>setHeaderField("freightAmount",e.target.value)}
-              readOnly={!!editingShipment?.freightInvoicedAt}
-              style={editingShipment?.freightInvoicedAt?{background:"#F5F7FA"}:undefined}/>
-            {editingShipment?.freightInvoicedAt
-              ? <small style={{color:"#8B7500",fontSize:10}}>この運賃は請求済みのため変更できません。直すには請求タブで該当請求を取消してください。</small>
-              : <small style={{color:"#888",fontSize:10}}>別途運賃を請求する場合のみ入力。請求書に「運賃」として税率10%で1行追加されます(空欄=運賃なし)。</small>}
-          </div>
+        </div>
+
+        {/* ---- 運賃(お客様へ別途請求する分) ---- */}
+        {/* 「送料別」にチェックを入れると、運送会社×納品先の運賃マスタから金額を自動で引く。
+            自動で入れた後もユーザーが金額を直せるようにしてある(実際の請求額が違う場合があるため)。
+            請求済みの運賃は金額を固定し、事故を防ぐ。 */}
+        <div className="card" style={{background:"#F9FAFB",boxShadow:"none",padding:10,marginBottom:8}}>
+          <label style={{display:"inline-flex",alignItems:"center",gap:6,fontSize:12,fontWeight:"bold"}}>
+            <input type="checkbox" style={{width:"auto"}} checked={!!header.freightSeparate}
+              disabled={!!editingShipment?.freightInvoicedAt}
+              onChange={e=>setFreightSeparate(e.target.checked)}/>
+            送料別（この出荷の運賃をお客様へ別途請求する）
+          </label>
+          {header.freightSeparate && (
+            <div className="grid-4" style={{marginTop:8}}>
+              <div className="form-row"><label>運賃(お客様請求分)</label>
+                <input type="number" min="0" value={header.freightAmount}
+                  onChange={e=>setHeaderField("freightAmount",e.target.value)}
+                  readOnly={!!editingShipment?.freightInvoicedAt}
+                  style={editingShipment?.freightInvoicedAt?{background:"#F5F7FA"}:undefined}/>
+              </div>
+              <div className="form-row" style={{gridColumn:"span 3"}}><label>&nbsp;</label>
+                <div style={{fontSize:11,color:"#666",paddingTop:6}}>
+                  {editingShipment?.freightInvoicedAt
+                    ? <span style={{color:"#8B7500"}}>この運賃は請求済みのため変更できません。直すには請求タブで該当請求を取消してください。</span>
+                    : freightHint}
+                </div>
+              </div>
+            </div>
+          )}
         </div>
         <div className="form-row"><label>備考</label><input value={header.note} onChange={e=>setHeaderField("note",e.target.value)}/></div>
 
@@ -4306,7 +4438,7 @@ function PartnersTab({data,update}){
     <div className="card">
       <div className="flex-between" style={{marginBottom:12}}>
         <h2 style={{border:"none",padding:0}}>取引先マスタ ({list.length}社)</h2>
-        <button className="btn btn-primary" onClick={()=>setEditing({name:"",type:"customer",kind:"現行",active:true,isProcessor:false,isExport:false,currency:"JPY",invoiceBasis:"delivery",closingDay:"月末",paymentMonthOffset:1,paymentDay:"月末",billingCadence:"afterFullDelivery"})}>＋ 新規</button>
+        <button className="btn btn-primary" onClick={()=>setEditing({name:"",type:"customer",kind:"現行",active:true,isProcessor:false,isCarrier:false,isExport:false,currency:"JPY",invoiceBasis:"delivery",closingDay:"月末",paymentMonthOffset:1,paymentDay:"月末",billingCadence:"afterFullDelivery"})}>＋ 新規</button>
       </div>
       <div className="flex" style={{marginBottom:12}}>
         <input placeholder="検索..." value={search} onChange={e=>setSearch(e.target.value)} style={{flex:1}}/>
@@ -4402,6 +4534,11 @@ function PartnerModal({partner,data,update,onSave,onClose}){
             <label style={{display:"inline-flex",alignItems:"center",gap:6,fontSize:12}}>
               <input type="checkbox" style={{width:"auto"}} checked={!!p.isProcessor} onChange={e=>set("isProcessor",e.target.checked)}/>
               <strong>加工委託先</strong>（この会社に加工をお願いする）
+            </label>
+            {/* 運賃マスタと出荷画面の「運送会社」の選択肢は、このチェックが付いた取引先だけを出す。 */}
+            <label style={{display:"inline-flex",alignItems:"center",gap:6,fontSize:12}}>
+              <input type="checkbox" style={{width:"auto"}} checked={!!p.isCarrier} onChange={e=>set("isCarrier",e.target.checked)}/>
+              <strong>運送会社</strong>（出荷の配送をお願いする）
             </label>
             <label style={{display:"inline-flex",alignItems:"center",gap:6,fontSize:12}}>
               <input type="checkbox" style={{width:"auto"}} checked={!!p.isExport} onChange={e=>set("isExport",e.target.checked)}/>
@@ -4540,9 +4677,20 @@ function PricesTab({data,update}){
   const [filterPart,setFilterPart] = useState("");
   const [filterProd,setFilterProd] = useState("");
   const [editing,setEditing] = useState(null);
+  const [pairEditing,setPairEditing] = useState(null); // 仕入と販売をまとめて登録するモーダル
   let list = data.prices || [];
   if (filterPart) list = list.filter(p=>p.partnerId===filterPart);
   if (filterProd) list = list.filter(p=>p.productId===filterProd);
+  // 入力順ではなく取引先順に並べる。同じ取引先の中は 商品名 → 種別 → 適用開始日(新しい順)。
+  // data.pricesを直接sortすると元配列を壊すので必ずコピーしてから並べ替える。
+  const partnerNameOf = id => (data.partners.find(x=>x.id===id)||{}).name || "";
+  const productNameOf = id => (data.products.find(x=>x.id===id)||{}).name || "";
+  list = [...list].sort((a,b)=>
+    partnerNameOf(a.partnerId).localeCompare(partnerNameOf(b.partnerId),"ja") ||
+    productNameOf(a.productId).localeCompare(productNameOf(b.productId),"ja") ||
+    String(a.priceType||"").localeCompare(String(b.priceType||"")) ||
+    String(b.startDate||"").localeCompare(String(a.startDate||""))
+  );
   const save = p => {
     const errors = [];
     if (!p.partnerId) errors.push("取引先は必須です");
@@ -4567,6 +4715,42 @@ function PricesTab({data,update}){
     });
     setEditing(null);
   };
+  // 仕入と販売をまとめて登録する。入力された側だけを単価レコードに変換して保存する。
+  const savePair = f => {
+    const errors = [];
+    if (!f.productId) errors.push("商品は必須です");
+    if (!f.startDate) errors.push("適用開始日は必須です");
+    const hasPurchase = f.supplierId && f.purchasePrice !== "";
+    const hasSale = f.customerId && f.salePrice !== "";
+    if (!hasPurchase && !hasSale) errors.push("仕入・販売のどちらか一方は入力してください（取引先と単価の両方が必要です）");
+    if (f.purchasePrice !== "" && Number(f.purchasePrice) < 0) errors.push("仕入単価にマイナスは入力できません");
+    if (f.salePrice !== "" && Number(f.salePrice) < 0) errors.push("販売単価にマイナスは入力できません");
+    // 作ろうとしている2行それぞれについて、既存の重複期間を先に全部調べてからまとめて知らせる
+    const rows = [];
+    if (hasPurchase) rows.push({partnerId:f.supplierId, productId:f.productId, sanchi:f.sanchi, priceType:"purchase",
+      unitPrice:Number(f.purchasePrice), taxRate:f.taxRate, currency:"JPY", startDate:f.startDate, endDate:f.endDate, note:f.note||""});
+    if (hasSale) rows.push({partnerId:f.customerId, productId:f.productId, sanchi:f.sanchi, priceType:"sale",
+      unitPrice:Number(f.salePrice), taxRate:f.taxRate, currency:"JPY", startDate:f.startDate, endDate:f.endDate, note:f.note||""});
+    rows.forEach(r=>{
+      const ov = findOverlappingPrice(data.prices||[], r);
+      if (ov) {
+        const pt = data.partners.find(x=>x.id===r.partnerId);
+        const pd = data.products.find(x=>x.id===r.productId);
+        errors.push(`${r.priceType==="sale"?"販売":"仕入"}：同一条件(${pt?.name||""}/${pd?.name||""}/${r.sanchi})で適用期間が重複する単価が既に存在します(${fmtDate(ov.startDate)}〜${ov.endDate?fmtDate(ov.endDate):"無期限"})`);
+      }
+    });
+    if (errors.length) { alert("入力エラー:\n・"+errors.join("\n・")); return; }
+    update(d=>{
+      d.prices = d.prices || [];
+      rows.forEach(r=>{
+        r.id = newId("price");
+        d.prices.push(r);
+        d = addAuditLog(d, {action:"create", targetType:"price", targetId:r.id, before:null, after:r});
+      });
+      return d;
+    });
+    setPairEditing(null);
+  };
   const del = id => {
     // 単価は取引にIDで直接紐づかない(値をコピーして使う)ため常に物理削除可
     if(!confirm("削除?"))return;
@@ -4581,7 +4765,11 @@ function PricesTab({data,update}){
     <div className="card">
       <div className="flex-between" style={{marginBottom:12}}>
         <h2 style={{border:"none",padding:0}}>単価マスタ ({list.length}行) 期間別価格</h2>
-        <button className="btn btn-primary" onClick={()=>setEditing({partnerId:"",productId:"",sanchi:"熊本",priceType:"sale",unitPrice:0,taxRate:0.1,startDate:today(),endDate:""})}>＋ 新規</button>
+        <div className="flex" style={{gap:8}}>
+          <button className="btn btn-secondary" onClick={()=>setPairEditing({productId:"",sanchi:"熊本",startDate:today(),endDate:"",taxRate:0.1,
+            supplierId:"",purchasePrice:"",customerId:"",salePrice:""})}>＋ 仕入と販売をまとめて登録</button>
+          <button className="btn btn-primary" onClick={()=>setEditing({partnerId:"",productId:"",sanchi:"熊本",priceType:"sale",unitPrice:0,taxRate:0.1,startDate:today(),endDate:""})}>＋ 新規</button>
+        </div>
       </div>
       <div className="flex" style={{marginBottom:12}}>
         <select value={filterPart} onChange={e=>setFilterPart(e.target.value)}>
@@ -4601,7 +4789,9 @@ function PricesTab({data,update}){
             const pd = data.products.find(x=>x.id===p.productId);
             return <tr key={p.id}>
               <td>{pt?.name}</td><td>{pd?.name}</td><td>{p.sanchi}</td>
-              <td>{p.priceType==="sale"?"販売":"仕入"}</td>
+              {/* 種別は販売/仕入/加工賃の3種類ある。"販売でなければ仕入"と判定すると
+                  加工賃(processing)まで「仕入」と表示されてしまうので、3つを明示的に出す。 */}
+              <td>{({sale:"販売",purchase:"仕入",processing:"加工賃"})[p.priceType]||p.priceType}</td>
               <td className="text-right price">{yen(p.unitPrice)}</td>
               <td style={{fontSize:11}}>{fmtDate(p.startDate)}〜{p.endDate?fmtDate(p.endDate):"無期限"}</td>
               <td>
@@ -4614,6 +4804,83 @@ function PricesTab({data,update}){
       </table>
       {list.length > 300 && <p style={{marginTop:8,color:"#999"}}>...他{list.length-300}行 (フィルタで絞ってください)</p>}
       {editing && <PriceModal price={editing} data={data} onSave={save} onClose={()=>setEditing(null)}/>}
+      {pairEditing && <PricePairModal init={pairEditing} data={data} onSave={savePair} onClose={()=>setPairEditing(null)}/>}
+    </div>
+  );
+}
+// ---- 1つの商品について「どこからいくらで仕入れ、どこにいくらで売るか」をまとめて登録する ----
+// 保存すると仕入行と販売行の2件の単価レコードになる(片方だけ入力すれば1件だけ作る)。
+// 単価は「販売=お客様のID」「仕入=仕入先のID」に紐づく仕様(findPriceがそう引く)なので、
+// この画面でも仕入先と販売先を別々に選ばせる。
+function PricePairModal({init,data,onSave,onClose}){
+  const [f,setF] = useState(init);
+  const set = (k,v) => setF({...f,[k]:v});
+  const suppliers = (data.partners||[]).filter(p=>isSupplier(p));
+  const customers = (data.partners||[]).filter(p=>isCustomer(p));
+  const pp = f.purchasePrice==="" ? null : Number(f.purchasePrice);
+  const sp = f.salePrice==="" ? null : Number(f.salePrice);
+  const margin = (pp!=null && sp!=null) ? sp-pp : null;
+  const marginRate = (margin!=null && sp>0) ? (margin/sp*100) : null;
+  return (
+    <div className="modal-bg" onClick={onClose}>
+      <div className="modal" style={{width:680}} onClick={e=>e.stopPropagation()}>
+        <h3>仕入と販売をまとめて登録</h3>
+        <p style={{fontSize:11,color:"#666",marginBottom:10}}>
+          1つの商品について、仕入先と販売先の単価を同時に登録します。保存すると単価マスタに2行（仕入・販売）として入ります。片方だけ入力しても構いません。
+        </p>
+        <div className="grid-2">
+          <div className="form-row"><label>商品 *</label>
+            <select value={f.productId||""} onChange={e=>set("productId",e.target.value)}>
+              <option value="">選択...</option>
+              {data.products.filter(p=>p.active!==false).map(pd=><option key={pd.id} value={pd.id}>{pd.name}</option>)}
+            </select>
+          </div>
+          <div className="form-row"><label>産地</label>
+            <select value={f.sanchi||"熊本"} onChange={e=>set("sanchi",e.target.value)}><option>熊本</option><option>広島</option></select>
+          </div>
+          <div className="form-row"><label>適用開始日 *</label><input type="date" value={f.startDate||""} onChange={e=>set("startDate",e.target.value)}/></div>
+          <div className="form-row"><label>適用終了日(空欄=無期限)</label><input type="date" value={f.endDate||""} onChange={e=>set("endDate",e.target.value)}/></div>
+        </div>
+        <div className="card" style={{background:"#F9FAFB",boxShadow:"none",padding:10,marginTop:6,marginBottom:6}}>
+          <strong style={{fontSize:12}}>仕入（どこからいくらで買うか）</strong>
+          <div className="grid-2" style={{marginTop:6}}>
+            <div className="form-row"><label>仕入先</label>
+              <select value={f.supplierId||""} onChange={e=>set("supplierId",e.target.value)}>
+                <option value="">(登録しない)</option>
+                {suppliers.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+            </div>
+            <div className="form-row"><label>仕入単価(税抜)</label><input type="number" min="0" value={f.purchasePrice} onChange={e=>set("purchasePrice",e.target.value)}/></div>
+          </div>
+        </div>
+        <div className="card" style={{background:"#F9FAFB",boxShadow:"none",padding:10,marginBottom:6}}>
+          <strong style={{fontSize:12}}>販売（どこにいくらで売るか）</strong>
+          <div className="grid-2" style={{marginTop:6}}>
+            <div className="form-row"><label>販売先(お客様)</label>
+              <select value={f.customerId||""} onChange={e=>set("customerId",e.target.value)}>
+                <option value="">(登録しない)</option>
+                {customers.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+            </div>
+            <div className="form-row"><label>販売単価(税抜)</label><input type="number" min="0" value={f.salePrice} onChange={e=>set("salePrice",e.target.value)}/></div>
+          </div>
+        </div>
+        <div className="form-row"><label>税率</label>
+          <select value={f.taxRate||0.1} onChange={e=>set("taxRate",Number(e.target.value))} style={{maxWidth:200}}>
+            <option value="0.08">8% 軽減</option><option value="0.1">10% 標準</option>
+          </select>
+        </div>
+        {margin!=null && (
+          <div className="summary-box" style={{marginTop:8}}>
+            <div className="item"><div className="lbl">粗利(1単位あたり)</div><div className="val" style={{color:margin<0?"#DC3545":undefined}}>{yen(margin)}</div></div>
+            <div className="item"><div className="lbl">粗利率</div><div className="val" style={{color:margin<0?"#DC3545":undefined}}>{marginRate!=null?marginRate.toFixed(1)+"%":"-"}</div></div>
+          </div>
+        )}
+        <div className="flex" style={{justifyContent:"flex-end",marginTop:12}}>
+          <button className="btn btn-secondary" onClick={onClose}>キャンセル</button>
+          <button className="btn btn-primary" onClick={()=>onSave(f)}>保存</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -4663,6 +4930,152 @@ function PriceModal({price,data,onSave,onClose}){
         <div className="flex" style={{justifyContent:"flex-end",marginTop:12}}>
           <button className="btn btn-secondary" onClick={onClose}>キャンセル</button>
           <button className="btn btn-primary" onClick={()=>onSave(p)}>保存</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ================================================================
+// 運賃マスタ タブ (運送会社 × 納品先 → 運賃)
+// ================================================================
+function FreightRatesTab({data,update}){
+  const [editing,setEditing] = useState(null);
+  const [filterCarrier,setFilterCarrier] = useState("");
+  const carriers = (data.partners||[]).filter(p=>p.isCarrier);
+  const dests = (data.deliveryDestinations||[]).filter(dd=>dd.active!==false);
+  const partnerName = id => (data.partners.find(x=>x.id===id)||{}).name || "";
+  const destOf = id => (data.deliveryDestinations||[]).find(x=>x.id===id);
+  const destLabel = id => {
+    const dd = destOf(id);
+    if (!dd) return "(削除済みの納品先)";
+    return `${partnerName(dd.partnerId)} / ${dd.name}`;
+  };
+
+  let list = data.freightRates || [];
+  if (filterCarrier) list = list.filter(r=>r.carrierId===filterCarrier);
+  // 運送会社順 → 納品先順 → 適用開始日の新しい順
+  list = [...list].sort((a,b)=>
+    partnerName(a.carrierId).localeCompare(partnerName(b.carrierId),"ja") ||
+    destLabel(a.destinationId).localeCompare(destLabel(b.destinationId),"ja") ||
+    String(b.startDate||"").localeCompare(String(a.startDate||""))
+  );
+
+  const save = r => {
+    const errors = [];
+    if (!r.carrierId) errors.push("運送会社は必須です");
+    if (!r.destinationId) errors.push("納品先は必須です");
+    if (!r.startDate) errors.push("適用開始日は必須です");
+    if (Number(r.unitPrice) < 0) errors.push("運賃にマイナスは入力できません");
+    if (r.carrierId && r.destinationId && r.startDate) {
+      const ov = findOverlappingFreightRate(data.freightRates||[], r);
+      if (ov) errors.push(`同じ運送会社×納品先で適用期間が重複する運賃が既にあります(${fmtDate(ov.startDate)}〜${ov.endDate?fmtDate(ov.endDate):"無期限"})`);
+    }
+    if (errors.length) { alert("入力エラー:\n・"+errors.join("\n・")); return; }
+    update(d=>{
+      d.freightRates = d.freightRates || [];
+      const before = r.id ? d.freightRates.find(x=>x.id===r.id) : null;
+      if (r.id) d.freightRates = d.freightRates.map(x=>x.id===r.id?r:x);
+      else { r.id = newId("frt"); d.freightRates.push(r); }
+      d = addAuditLog(d, {action: before?"update":"create", targetType:"freightRate", targetId:r.id, before, after:r});
+      return d;
+    });
+    setEditing(null);
+  };
+  const del = id => {
+    // 運賃は出荷にIDで紐づかない(金額をコピーして使う)ため常に物理削除可
+    if(!confirm("削除?"))return;
+    const before = (data.freightRates||[]).find(x=>x.id===id);
+    update(d=>{
+      d = addAuditLog(d, {action:"delete", targetType:"freightRate", targetId:id, before, after:null});
+      d.freightRates = (d.freightRates||[]).filter(r=>r.id!==id);
+      return d;
+    });
+  };
+
+  return (
+    <div className="card">
+      <div className="flex-between" style={{marginBottom:12}}>
+        <h2 style={{border:"none",padding:0}}>運賃マスタ ({list.length}行) 運送会社×納品先</h2>
+        <button className="btn btn-primary" disabled={carriers.length===0||dests.length===0}
+          onClick={()=>setEditing({carrierId:"",destinationId:"",rateType:"perCase",unitPrice:0,startDate:today(),endDate:"",note:""})}>＋ 新規</button>
+      </div>
+      <p style={{fontSize:11,color:"#666",marginBottom:10}}>
+        💡 ここに登録しておくと、納品タブの出荷登録で「運賃を別途請求する」にチェックを入れて運送会社と納品先を選んだとき、運賃が自動で入ります。
+      </p>
+      {carriers.length===0 && <div style={{background:"#FFF2CC",padding:8,borderRadius:4,fontSize:12,marginBottom:10}}>
+        ⚠ 運送会社が1社も登録されていません。取引先マスタでその会社を開き「運送会社」にチェックを入れてください。
+      </div>}
+      {dests.length===0 && <div style={{background:"#FFF2CC",padding:8,borderRadius:4,fontSize:12,marginBottom:10}}>
+        ⚠ 納品先が1件も登録されていません。取引先マスタでお客様を開き、納品先を追加してください。
+      </div>}
+      <div className="flex" style={{marginBottom:12}}>
+        <select value={filterCarrier} onChange={e=>setFilterCarrier(e.target.value)}>
+          <option value="">全ての運送会社</option>
+          {carriers.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}
+        </select>
+      </div>
+      <table>
+        <thead><tr><th>運送会社</th><th>納品先</th><th>計算方法</th><th className="text-right">運賃</th><th>適用期間</th><th>備考</th><th></th></tr></thead>
+        <tbody>
+          {list.map(r=>(
+            <tr key={r.id}>
+              <td>{partnerName(r.carrierId)}</td>
+              <td>{destLabel(r.destinationId)}</td>
+              <td>{r.rateType==="flat"?"1回の出荷につき定額":"1ケースあたり"}</td>
+              <td className="text-right price">{yen(r.unitPrice)}</td>
+              <td style={{fontSize:11}}>{fmtDate(r.startDate)}〜{r.endDate?fmtDate(r.endDate):"無期限"}</td>
+              <td style={{fontSize:11}}>{r.note||""}</td>
+              <td>
+                <button className="btn btn-secondary btn-sm" onClick={()=>setEditing(r)}>編集</button>
+                <button className="btn btn-danger btn-sm" style={{marginLeft:4}} onClick={()=>del(r.id)}>削除</button>
+              </td>
+            </tr>
+          ))}
+          {list.length===0 && <tr><td colSpan={7} style={{color:"#888",fontSize:12}}>運賃がまだ登録されていません</td></tr>}
+        </tbody>
+      </table>
+      {editing && <FreightRateModal rate={editing} data={data} onSave={save} onClose={()=>setEditing(null)}/>}
+    </div>
+  );
+}
+function FreightRateModal({rate,data,onSave,onClose}){
+  const [r,setR] = useState(rate);
+  const set = (k,v) => setR({...r,[k]:v});
+  const carriers = (data.partners||[]).filter(p=>p.isCarrier);
+  const partnerName = id => (data.partners.find(x=>x.id===id)||{}).name || "";
+  const dests = (data.deliveryDestinations||[]).filter(dd=>dd.active!==false);
+  return (
+    <div className="modal-bg" onClick={onClose}>
+      <div className="modal" style={{width:600}} onClick={e=>e.stopPropagation()}>
+        <h3>{r.id?"運賃編集":"運賃新規登録"}</h3>
+        <div className="grid-2">
+          <div className="form-row"><label>運送会社 *</label>
+            <select value={r.carrierId||""} onChange={e=>set("carrierId",e.target.value)}>
+              <option value="">選択...</option>
+              {carriers.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+          </div>
+          <div className="form-row"><label>納品先 *</label>
+            <select value={r.destinationId||""} onChange={e=>set("destinationId",e.target.value)}>
+              <option value="">選択...</option>
+              {dests.map(dd=><option key={dd.id} value={dd.id}>{partnerName(dd.partnerId)} / {dd.name}</option>)}
+            </select>
+          </div>
+          <div className="form-row"><label>計算方法</label>
+            <select value={r.rateType||"perCase"} onChange={e=>set("rateType",e.target.value)}>
+              <option value="perCase">1ケースあたり（出荷ケース数を掛ける）</option>
+              <option value="flat">1回の出荷につき定額</option>
+            </select>
+          </div>
+          <div className="form-row"><label>運賃(税抜)</label><input type="number" min="0" value={r.unitPrice||0} onChange={e=>set("unitPrice",Number(e.target.value))}/></div>
+          <div className="form-row"><label>適用開始日 *</label><input type="date" value={r.startDate||""} onChange={e=>set("startDate",e.target.value)}/></div>
+          <div className="form-row"><label>適用終了日(空欄=無期限)</label><input type="date" value={r.endDate||""} onChange={e=>set("endDate",e.target.value)}/></div>
+        </div>
+        <div className="form-row"><label>備考</label><input value={r.note||""} onChange={e=>set("note",e.target.value)}/></div>
+        <div className="flex" style={{justifyContent:"flex-end",marginTop:12}}>
+          <button className="btn btn-secondary" onClick={onClose}>キャンセル</button>
+          <button className="btn btn-primary" onClick={()=>onSave(r)}>保存</button>
         </div>
       </div>
     </div>
