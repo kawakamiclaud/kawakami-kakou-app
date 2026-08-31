@@ -699,6 +699,101 @@ function findPrice(prices, partnerId, productId, sanchi, date, priceType) {
 }
 
 // ================================================================
+// 請求書PDF (Googleドライブ保存用)
+// ================================================================
+// GASへ送るための請求書HTMLを組み立てる。Reactの印刷ビューとは別に、
+// 単体で完結する静的HTMLを作る(GAS側はこのHTMLをそのままPDFへ変換するため、
+// 外部CSSやフォントに依存させない)。
+function escapeHtml(s){
+  return String(s==null?"":s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+}
+function buildInvoiceHtml({company, customer, invoiceNo, issueDate, dueDate, targetMonth, lines, subtotalByTaxRate, taxByTaxRate, total}){
+  const co = company || {};
+  const row = (l)=>`<tr>
+    <td>${escapeHtml(l.transactionDate ? fmtDate(l.transactionDate) : "")}</td>
+    <td>${escapeHtml(l.productName)}${l.sanchi?`<span class="sub"> (${escapeHtml(l.sanchi)})</span>`:""}</td>
+    <td class="r">${escapeHtml(l.qty)}${escapeHtml(l.unit||"")}</td>
+    <td class="r">${yen(l.unitPrice)}</td>
+    <td class="r">${yen(l.amount)}</td>
+    <td class="c">${l.taxRate===0.08?"8%":"10%"}</td>
+  </tr>`;
+  const taxRows = [];
+  if (subtotalByTaxRate["0.08"]>0) taxRows.push(`<tr><td>8%対象</td><td class="r">${yen(subtotalByTaxRate["0.08"])}</td><td class="r">${yen(taxByTaxRate["0.08"])}</td></tr>`);
+  if (subtotalByTaxRate["0.10"]>0) taxRows.push(`<tr><td>10%対象</td><td class="r">${yen(subtotalByTaxRate["0.10"])}</td><td class="r">${yen(taxByTaxRate["0.10"])}</td></tr>`);
+  const bank = [co.bankName, co.branchName, co.accountType, co.accountNumber].filter(Boolean).join(" ");
+  return `<!doctype html><html lang="ja"><head><meta charset="UTF-8"><style>
+  *{box-sizing:border-box}
+  body{font-family:"Yu Gothic","Meiryo",sans-serif;font-size:11pt;color:#000;margin:0;padding:18mm 15mm}
+  h1{font-size:20pt;text-align:center;letter-spacing:6px;margin:0 0 14px}
+  .head{display:flex;justify-content:space-between;margin-bottom:14px}
+  .to{width:52%}
+  .to .name{font-size:14pt;font-weight:bold;border-bottom:1px solid #000;padding-bottom:4px;margin-bottom:6px}
+  .from{width:44%;font-size:9.5pt;line-height:1.6}
+  .from .co{font-size:12pt;font-weight:bold}
+  .meta{font-size:9.5pt;text-align:right;line-height:1.6;margin-bottom:10px}
+  .total-box{border:2px solid #000;padding:8px 12px;margin:10px 0 14px;display:flex;justify-content:space-between;align-items:center}
+  .total-box .lbl{font-size:11pt;font-weight:bold}
+  .total-box .val{font-size:18pt;font-weight:bold}
+  table{width:100%;border-collapse:collapse;font-size:9.5pt}
+  th,td{border:1px solid #666;padding:5px 6px}
+  th{background:#EEE;font-weight:bold;text-align:center}
+  td.r{text-align:right}
+  td.c{text-align:center}
+  .sub{font-size:8.5pt;color:#555}
+  .foot{display:flex;justify-content:space-between;margin-top:14px;gap:20px}
+  .tax-table{width:48%}
+  .bank{width:48%;font-size:9.5pt;line-height:1.7}
+  .note{margin-top:14px;font-size:9pt;color:#333}
+  </style></head><body>
+  <h1>請 求 書</h1>
+  <div class="meta">請求No: ${escapeHtml(invoiceNo)}　／　発行日: ${escapeHtml(fmtDate(issueDate))}</div>
+  <div class="head">
+    <div class="to">
+      <div class="name">${escapeHtml(customer.formalName || customer.name)}</div>
+      <div style="font-size:9.5pt">下記のとおりご請求申し上げます。</div>
+    </div>
+    <div class="from">
+      <div class="co">${escapeHtml(co.name||"")}</div>
+      ${co.zip?`〒${escapeHtml(co.zip)}<br>`:""}
+      ${co.address?`${escapeHtml(co.address)}<br>`:""}
+      ${co.tel?`TEL: ${escapeHtml(co.tel)}　`:""}${co.fax?`FAX: ${escapeHtml(co.fax)}`:""}
+      ${co.registrationNumber?`<br>登録番号: ${escapeHtml(co.registrationNumber)}`:""}
+      ${co.personInCharge?`<br>担当: ${escapeHtml(co.personInCharge)}`:""}
+    </div>
+  </div>
+  <div class="total-box">
+    <span class="lbl">ご請求金額（税込）</span>
+    <span class="val">${yen(total)}</span>
+  </div>
+  <div style="font-size:9.5pt;margin-bottom:6px">対象期間: ${escapeHtml(targetMonth)}分${dueDate?`　／　お支払期限: ${escapeHtml(fmtDate(dueDate))}`:""}</div>
+  <table>
+    <thead><tr><th style="width:14%">日付</th><th>品目</th><th style="width:12%">数量</th><th style="width:14%">単価</th><th style="width:16%">金額</th><th style="width:8%">税率</th></tr></thead>
+    <tbody>${lines.map(row).join("")}</tbody>
+  </table>
+  <div class="foot">
+    <table class="tax-table">
+      <thead><tr><th>区分</th><th>税抜金額</th><th>消費税</th></tr></thead>
+      <tbody>${taxRows.join("")}
+        <tr><td><strong>合計</strong></td><td class="r"><strong>${yen(subtotalByTaxRate["0.08"]+subtotalByTaxRate["0.10"])}</strong></td><td class="r"><strong>${yen(taxByTaxRate["0.08"]+taxByTaxRate["0.10"])}</strong></td></tr>
+      </tbody>
+    </table>
+    <div class="bank">
+      ${bank?`<strong>お振込先</strong><br>${escapeHtml(bank)}<br>${escapeHtml(co.accountHolder||"")}`:""}
+    </div>
+  </div>
+  <div class="note">※ 消費税は税率ごとに合計した税抜金額に対して計算しています。</div>
+  </body></html>`;
+}
+// 請求書PDFをGAS経由でGoogleドライブへ保存する。
+// 共有データベースと同じWeb App URL・アクセスコードを使う(別途の設定は不要)。
+// Content-Typeヘッダーは付けない(既存のbackendCallと同じ。付けるとCORSプリフライトに引っかかる)
+async function backendSaveInvoicePdf(config, fileName, subFolder, html){
+  const j = await backendCall(config, {action:"saveInvoicePdf", fileName, subFolder, html});
+  if (!j || !j.ok) throw new Error((j && j.error) || "PDFの保存に失敗しました");
+  return j.result;
+}
+
+// ================================================================
 // 運賃マスタ(運送会社×納品先) 共通ヘルパー
 // ================================================================
 // 運賃は「どの運送会社で、どの納品先へ運ぶか」の組み合わせで決まる。
@@ -934,10 +1029,13 @@ const supportsFSA = typeof window !== "undefined" && "showSaveFilePicker" in win
 // ================================================================
 const BACKEND_CONFIG_KEY = "backend_config_kakou_v3";  // 肥料農薬アプリと衝突しないようアプリ固有のキーにする
 // pullAllのレスポンス/pushの対象となる14種類の配列名。data直下のキー名とAPI側entity名は完全一致。
-const BACKEND_ENTITIES = ["products","partners","prices","freightRates","transactions","quotations","deliveryDestinations","shipments","documents","warehouses","inventoryMovements","lots","allocations","payments","processingOrders","auditLog"];
+// ⚠️ invoices(請求書)がこの一覧から漏れていると、発行した請求書が共有DBへ送られず、
+//    30秒ごとの取り込みでローカルの請求書が空で上書きされて消える(取引側の請求済みだけが残る)。
+//    請求書は入金消込の相手でもあるので、必ず同期対象に含めること。
+const BACKEND_ENTITIES = ["products","partners","prices","freightRates","transactions","quotations","deliveryDestinations","shipments","invoices","documents","warehouses","inventoryMovements","lots","allocations","payments","processingOrders","auditLog"];
 const BACKEND_ENTITY_LABELS = {
   products:"商品", partners:"取引先", prices:"単価", transactions:"取引",
-  quotations:"見積", deliveryDestinations:"納品先", shipments:"出荷", documents:"帳票", freightRates:"運賃",
+  quotations:"見積", deliveryDestinations:"納品先", shipments:"出荷", documents:"帳票", freightRates:"運賃", invoices:"請求書",
   warehouses:"倉庫", inventoryMovements:"入出庫履歴", lots:"ロット", allocations:"在庫引当",
   payments:"入金", processingOrders:"加工委託", auditLog:"操作履歴",
 };
@@ -1472,7 +1570,7 @@ function App(){
       {tab==="quotations" && <QuotationsTab data={data} update={update}/>}
       {tab==="transactions" && <TransactionsTab data={data} update={update}/>}
       {tab==="deliveries" && <DeliveriesTab data={data} update={update}/>}
-      {tab==="invoicing" && <InvoicingTab data={data} update={update} freeeConfig={freeeConfig} onNeedConfig={()=>setShowFreeeConfig(true)}/>}
+      {tab==="invoicing" && <InvoicingTab data={data} update={update} freeeConfig={freeeConfig} backendConfig={backendConfig} onNeedConfig={()=>setShowFreeeConfig(true)}/>}
       {tab==="processing" && <ProcessingTab data={data} update={update}/>}
       {tab==="inventory" && <InventoryTab data={data} update={update}/>}
       {tab==="payments" && <PaymentsTab data={data} update={update}/>}
@@ -2734,7 +2832,8 @@ function buildBillableLines(t, partner, products, shipments) {
   return [...itemLines, ...freightBillableLinesFor(t, partner, shipments)];
 }
 
-function InvoicingTab({data,update,freeeConfig,onNeedConfig}){
+function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
+  const [issuingPdf,setIssuingPdf] = useState(false); // PDF発行の二重クリック防止
   const [selectedMonth,setSelectedMonth] = useState(new Date().toISOString().slice(0,7));
   const [customerFilter,setCustomerFilter] = useState("");
   const [sending,setSending] = useState(false); // 二重クリック防止
@@ -2780,11 +2879,12 @@ function InvoicingTab({data,update,freeeConfig,onNeedConfig}){
   });
 
   // 同月・同客先で発行済(issued/reissued)のinvoice一覧(参考表示・取消用)
+  // 取消済みの請求書も履歴として残して表示する(証憑の記録なので画面から消さない)。
+  // 発行日時の新しい順に並べ、取消済みは一覧上でひと目で分かるようにする。
   const monthInvoices = (data.invoices||[]).filter(inv =>
     inv.targetMonth===selectedMonth &&
-    (customerFilter ? inv.customerId===customerFilter : true) &&
-    inv.status !== "cancelled"
-  );
+    (customerFilter ? inv.customerId===customerFilter : true)
+  ).sort((a,b)=>String(b.issuedAt||"").localeCompare(String(a.issuedAt||"")));
 
   const openPreview = (customerId, g) => {
     if (!freeeConfig?.accessToken || !freeeConfig?.companyId) {
@@ -2802,6 +2902,259 @@ function InvoicingTab({data,update,freeeConfig,onNeedConfig}){
       await confirmFreeeIssue(freeeConfig, {customerId:preview.customerId, lines:preview.lines, month:selectedMonth});
     } finally {
       setSending(false);
+    }
+  };
+
+  // ---- 請求書PDFを発行してGoogleドライブへ保存する ----
+  // freee発行と同じく「請求済みにする」処理を行うが、freeeへは送らない。
+  // 手順: ①PDFをドライブへ保存 → ②成功したら請求済みにする
+  // (先に請求済みにすると、保存に失敗したときに請求書が無いのに請求済みになってしまう)
+  const issueInvoicePdf = async (customerId, g) => {
+    if (issuingPdf) return;
+    if (!backendConfig?.url || !backendConfig?.accessCode) {
+      alert("共有データベースの設定が必要です。\n設定タブでWeb App URLとアクセスコードを入力してください。\n(PDFの保存にこの接続を使います)");
+      return;
+    }
+    const customer = data.partners.find(p=>p.id===customerId);
+    if (!customer) { alert("お客様が見つかりません"); return; }
+    if (!g.lines || g.lines.length===0) { alert("請求対象の明細がありません"); return; }
+
+    const totalTax = Math.floor(g.tax8*0.08) + Math.floor(g.tax10*0.10);
+    const total = g.total + totalTax;
+    const invoiceNo = genInvoiceNo(data.invoices, customer, selectedMonth);
+    if (!confirm(
+      `${customer.name} の ${selectedMonth}分 の請求書PDFを発行します。\n\n`+
+      `請求No: ${invoiceNo}\n請求金額(税込): ${yen(total)}\n\n`+
+      `発行すると、この分は「請求済み」になり、次回から請求対象から外れます。よろしいですか？`
+    )) return;
+
+    setIssuingPdf(true);
+    try {
+      const lastDay = new Date(selectedMonth+"-01");
+      lastDay.setMonth(lastDay.getMonth()+1);
+      lastDay.setDate(0);
+      const issueDate = lastDay.toISOString().slice(0,10);
+      const dueDate = calcDueDate(customer, issueDate);
+      const subtotalByTaxRate = {"0.08": g.tax8, "0.10": g.tax10};
+      const taxByTaxRate = {"0.08": Math.floor(g.tax8*0.08), "0.10": Math.floor(g.tax10*0.10)};
+
+      const html = buildInvoiceHtml({
+        company: data.meta?.companySettings||{}, customer, invoiceNo, issueDate, dueDate,
+        targetMonth: selectedMonth, lines: g.lines, subtotalByTaxRate, taxByTaxRate, total,
+      });
+      const fileName = `${customer.name}_${selectedMonth}_${invoiceNo}`;
+      const saved = await backendSaveInvoicePdf(backendConfig, fileName, selectedMonth, html);
+
+      const invoiceId = newId("inv");
+      const txIdsPreview = [...new Set(g.lines.map(l=>l.transactionId))];
+      const now = new Date().toISOString();
+      await update(d=>{
+        // 二重請求防止: 請求済みにする数量は必ずこの時点の最新stateから算出し直す
+        // (プレビューの内容ではなく、常に「納品済−請求済」ぴったりの量になる)
+        const invoiceLineItems = [];
+        const freightShipmentIds = [];
+        d.transactions = d.transactions.map(t=>{
+          if (!txIdsPreview.includes(t.id)) return t;
+          const freshLines = buildBillableLines(t, customer, d.products, d.shipments);
+          if (freshLines.length===0) return t;
+          const items = t.items.map(it=>{
+            const fl = freshLines.find(l=>l.transactionItemId===it.id);
+            if (!fl) return it;
+            invoiceLineItems.push({transactionId:t.id, transactionItemId:it.id, productId:it.productId,
+              billedQty:fl.qty, unitPrice:fl.unitPrice, amount:fl.amount, taxRate:fl.taxRate});
+            return {...it, invoicedQty: Number(it.invoicedQty||0) + fl.qty};
+          });
+          freshLines.filter(l=>l.isFreight).forEach(fl=>{
+            invoiceLineItems.push({transactionId:t.id, transactionItemId:null, shipmentId:fl.shipmentId, isFreight:true,
+              productId:null, billedQty:1, unitPrice:fl.unitPrice, amount:fl.amount, taxRate:fl.taxRate});
+            freightShipmentIds.push(fl.shipmentId);
+          });
+          const newTx = {...t, items};
+          newTx.status = computeTxStatus(newTx);
+          if (newTx.status === "invoiced") {
+            newTx.invoiceId = invoiceId; newTx.invoiceNo = invoiceNo; newTx.invoicedAt = now;
+            newTx.invoicedYearMonth = selectedMonth; newTx.invoicedDate = today();
+          }
+          return newTx;
+        });
+        if (freightShipmentIds.length) {
+          d.shipments = (d.shipments||[]).map(s =>
+            freightShipmentIds.includes(s.id) ? {...s, freightInvoicedAt: now} : s);
+        }
+        const txIds = [...new Set(invoiceLineItems.map(l=>l.transactionId))];
+        d.invoices = d.invoices || [];
+        const original = d.invoices.filter(i=>i.status==="cancelled" && i.txIds.some(id=>txIds.includes(id)))
+          .sort((a,b)=>new Date(b.cancelledAt)-new Date(a.cancelledAt))[0] || null;
+        d.invoices.push({
+          id: invoiceId, invoiceNo, customerId, targetMonth: selectedMonth,
+          txIds, items: invoiceLineItems, issuedAt: now, status: original ? "reissued" : "issued",
+          subtotalByTaxRate, taxByTaxRate, total,
+          cancelReason:null, cancelledAt:null, cancelledBy:null,
+          originalInvoiceId: original ? original.id : null,
+          // PDF発行はfreeeへ送っていないので、freee関連は「対象外」として記録する
+          freeeInvoiceId:null, freeeSentAt:null, freeeSendStatus:"not_applicable", freeeCancelStatus:"not_applicable",
+          freeeCancelledAt:null, freeeCancelledBy:null, freeeCancelError:null, retryable:false, lastSyncedAt:null,
+          issueMethod:"pdf", pdfFileId:saved.id, pdfFileName:saved.name, pdfUrl:saved.url,
+        });
+        d = addAuditLog(d, {action:"invoice_issue", targetType:"invoice", targetId:invoiceId, before:null,
+          after:{invoiceNo, customerId, txIds, total, issueMethod:"pdf", pdfUrl:saved.url}});
+        return d;
+      });
+      if (confirm(`請求書PDFを保存しました。\n\n請求No: ${invoiceNo}\nファイル: ${saved.name}\n保存先: 請求書PDF / ${saved.folder}\n\nドライブで開きますか？`)) {
+        window.open(saved.url, "_blank");
+      }
+    } catch(err) {
+      alert("請求書PDFの発行に失敗しました:\n"+(err.message||err)+"\n\n請求済みにはしていません。もう一度お試しください。");
+    } finally {
+      setIssuingPdf(false);
+    }
+  };
+
+  // ---- 請求書レコードが失われた分を、取引側の記録から復元する ----
+  // 過去に invoices が共有DBの同期対象から漏れていたため、発行した請求書が消えて
+  // 取引側の「請求済み・請求書番号」だけが残っている場合がある。その取りこぼしを拾う。
+  // 取引は一切変更せず、失われた請求書レコードを作り直すだけ(安全側に倒している)。
+  // useMemoにしないこと。update()はd.invoicesを直接pushして更新するため配列の参照が変わらず、
+  // 依存配列に data.invoices を入れても再計算されず、復元後も案内が消え続ける。
+  // 件数も小さいので毎回計算して構わない。
+  const orphanInvoices = (()=>{
+    const existing = new Set((data.invoices||[]).map(i=>i.id));
+    const groups = {};
+    (data.transactions||[]).forEach(t=>{
+      if (!t.invoiceId || !t.invoiceNo) return;
+      if (existing.has(t.invoiceId)) return;              // 請求書が残っているものは対象外
+      if (t.invoicedYearMonth !== selectedMonth) return;  // 表示中の月の分だけ扱う
+      const g = groups[t.invoiceId] || (groups[t.invoiceId] = {
+        invoiceId:t.invoiceId, invoiceNo:t.invoiceNo, customerId:t.customerId,
+        targetMonth:t.invoicedYearMonth, issuedAt:t.invoicedAt||null,
+        freeeInvoiceId:t.freeeInvoiceId||null, txs:[],
+      });
+      g.txs.push(t);
+    });
+    return Object.values(groups);
+  })();
+
+  const restoreOrphanInvoices = () => {
+    if (orphanInvoices.length===0) return;
+    const names = orphanInvoices.map(g=>{
+      const c = data.partners.find(p=>p.id===g.customerId);
+      return `・${g.invoiceNo}（${c?.name||"?"}）`;
+    }).join("\n");
+    if (!confirm(
+      `発行済みの記録が残っているのに、請求書が一覧から失われている分を復元します。\n\n${names}\n\n`+
+      `取引の請求済み数量や金額は変更しません。一覧に履歴として戻すだけです。\n`+
+      `※ 請求内訳は取引側の記録から組み立て直すため、当時のPDFと細部が異なる場合があります。\n\n`+
+      `復元しますか？`
+    )) return;
+
+    update(d=>{
+      d.invoices = d.invoices || [];
+      const already = new Set(d.invoices.map(i=>i.id));
+      orphanInvoices.forEach(g=>{
+        if (already.has(g.invoiceId)) return; // 二重復元の防止
+        const items = [];
+        const subtotalByTaxRate = {"0.08":0,"0.10":0};
+        g.txs.forEach(t=>{
+          const fresh = (d.transactions||[]).find(x=>x.id===t.id) || t;
+          (fresh.items||[]).forEach(it=>{
+            const qty = Number(it.invoicedQty||0);
+            if (qty<=0) return;
+            const p = (d.products||[]).find(x=>x.id===it.productId);
+            const rate = (p?.taxRate===0.08) ? 0.08 : 0.10;
+            const amount = qty * Number(it.salePrice||0);
+            items.push({transactionId:fresh.id, transactionItemId:it.id, productId:it.productId,
+              billedQty:qty, unitPrice:Number(it.salePrice||0), amount, taxRate:rate});
+            subtotalByTaxRate[rate===0.08?"0.08":"0.10"] += amount;
+          });
+          // この取引に紐づく出荷のうち、運賃が請求済みになっているものも請求内訳に戻す
+          (d.shipments||[]).forEach(s=>{
+            if (s.transactionId!==fresh.id || !s.freightInvoicedAt) return;
+            const amt = Number(s.freightAmount||0);
+            if (amt<=0) return;
+            items.push({transactionId:fresh.id, transactionItemId:null, shipmentId:s.id, isFreight:true,
+              productId:null, billedQty:1, unitPrice:amt, amount:amt, taxRate:0.10});
+            subtotalByTaxRate["0.10"] += amt;
+          });
+        });
+        const taxByTaxRate = {"0.08":Math.floor(subtotalByTaxRate["0.08"]*0.08), "0.10":Math.floor(subtotalByTaxRate["0.10"]*0.10)};
+        const total = subtotalByTaxRate["0.08"]+subtotalByTaxRate["0.10"]+taxByTaxRate["0.08"]+taxByTaxRate["0.10"];
+        d.invoices.push({
+          id:g.invoiceId, invoiceNo:g.invoiceNo, customerId:g.customerId, targetMonth:g.targetMonth,
+          txIds:g.txs.map(t=>t.id), items, issuedAt:g.issuedAt||new Date().toISOString(), status:"issued",
+          subtotalByTaxRate, taxByTaxRate, total,
+          cancelReason:null, cancelledAt:null, cancelledBy:null, originalInvoiceId:null,
+          freeeInvoiceId:g.freeeInvoiceId, freeeSentAt:null,
+          freeeSendStatus: g.freeeInvoiceId?"sent":"not_applicable", freeeCancelStatus:"not_applicable",
+          freeeCancelledAt:null, freeeCancelledBy:null, freeeCancelError:null, retryable:false, lastSyncedAt:null,
+          // PDFのURLは分からないので空。必要なら一覧の「PDF出し直し」で作り直せる。
+          issueMethod: g.freeeInvoiceId?"freee":"pdf", pdfFileId:null, pdfFileName:null, pdfUrl:null,
+          restoredFromTransactions:true, restoredAt:new Date().toISOString(),
+        });
+        d = addAuditLog(d, {action:"create", targetType:"invoice", targetId:g.invoiceId, before:null,
+          after:{invoiceNo:g.invoiceNo, customerId:g.customerId, total}, reason:"失われた請求書レコードを取引側の記録から復元"});
+      });
+      return d;
+    });
+    alert("請求書を復元しました。PDFが必要な場合は一覧の「PDF出し直し」で作り直せます。");
+  };
+
+  // ---- 発行済みの請求書からPDFだけを作り直す ----
+  // 請求済みの数量・請求番号は一切変えない。自社情報の直しや、PDFを紛失した場合に使う。
+  // 金額や数量を直す場合はこれではなく「取消」→内容修正→もう一度発行、の順で行う。
+  const reissueInvoicePdf = async (inv) => {
+    if (issuingPdf) return;
+    if (!backendConfig?.url || !backendConfig?.accessCode) {
+      alert("共有データベースの設定が必要です。設定タブでWeb App URLとアクセスコードを入力してください。");
+      return;
+    }
+    const customer = data.partners.find(p=>p.id===inv.customerId);
+    if (!customer) { alert("お客様が見つかりません"); return; }
+    if (!confirm(
+      `請求No ${inv.invoiceNo} のPDFを作り直してドライブに保存します。\n\n`+
+      `請求済みの数量や金額は変わりません。書類を作り直すだけです。\n`+
+      `(同じ名前のファイルがある場合は、上書きせず連番を付けて別ファイルにします)\n\nよろしいですか？`
+    )) return;
+
+    setIssuingPdf(true);
+    try {
+      // 保存済みの請求内訳(items)から明細を組み立て直す。商品名は現在のマスタから引く。
+      const lines = (inv.items||[]).map(li=>{
+        const p = data.products.find(x=>x.id===li.productId);
+        const shipment = li.isFreight ? (data.shipments||[]).find(s=>s.id===li.shipmentId) : null;
+        const tx = (data.transactions||[]).find(t=>t.id===li.transactionId);
+        return {
+          transactionDate: tx?.transactionDate || inv.issuedAt?.slice(0,10) || "",
+          productName: li.isFreight ? `運賃 (${shipment?.shipmentNo||""})` : (p?.name || "(削除された商品)"),
+          sanchi: tx?.sanchi || "",
+          qty: li.billedQty, unit: li.isFreight ? "式" : (p?.unit||""),
+          unitPrice: li.unitPrice, amount: li.amount, taxRate: li.taxRate,
+        };
+      });
+      const lastDay = new Date(inv.targetMonth+"-01");
+      lastDay.setMonth(lastDay.getMonth()+1);
+      lastDay.setDate(0);
+      const issueDate = inv.issuedAt ? inv.issuedAt.slice(0,10) : lastDay.toISOString().slice(0,10);
+      const html = buildInvoiceHtml({
+        company: data.meta?.companySettings||{}, customer, invoiceNo: inv.invoiceNo,
+        issueDate, dueDate: calcDueDate(customer, issueDate), targetMonth: inv.targetMonth,
+        lines, subtotalByTaxRate: inv.subtotalByTaxRate, taxByTaxRate: inv.taxByTaxRate, total: inv.total,
+      });
+      const saved = await backendSaveInvoicePdf(backendConfig,
+        `${customer.name}_${inv.targetMonth}_${inv.invoiceNo}`, inv.targetMonth, html);
+      await update(d=>{
+        d.invoices = (d.invoices||[]).map(x=>x.id===inv.id
+          ? {...x, pdfFileId:saved.id, pdfFileName:saved.name, pdfUrl:saved.url,
+             pdfReissueCount:Number(x.pdfReissueCount||0)+1, pdfReissuedAt:new Date().toISOString()}
+          : x);
+        d = addAuditLog(d, {action:"update", targetType:"invoice", targetId:inv.id, before:null,
+          after:{invoiceNo:inv.invoiceNo, pdfUrl:saved.url}, reason:"請求書PDFの出し直し"});
+        return d;
+      });
+      if (confirm(`PDFを作り直しました。\n\nファイル: ${saved.name}\n\nドライブで開きますか？`)) window.open(saved.url,"_blank");
+    } catch(err) {
+      alert("PDFの作り直しに失敗しました:\n"+(err.message||err));
+    } finally {
+      setIssuingPdf(false);
     }
   };
 
@@ -3082,6 +3435,9 @@ function InvoicingTab({data,update,freeeConfig,onNeedConfig}){
                 <span style={{fontSize:12,color:"#888"}}>消費税: ¥{totalTax.toLocaleString()}</span>
                 <span className="price" style={{fontSize:16}}>税込: {yen(g.total+totalTax)}</span>
                 <button className="btn btn-primary btn-sm" onClick={()=>openPreview(id, g)}>請求書発行(freee)</button>
+                {/* freeeを使わずに請求書PDFを発行してGoogleドライブへ保存する。請求済みの扱いはfreee発行と同じ。 */}
+                <button className="btn btn-primary btn-sm" style={{marginLeft:4}} disabled={issuingPdf}
+                  onClick={()=>issueInvoicePdf(id, g)}>{issuingPdf?"PDF発行中...":"請求書PDF発行"}</button>
               </div>
             </div>
             <table>
@@ -3133,19 +3489,51 @@ function InvoicingTab({data,update,freeeConfig,onNeedConfig}){
 
     <div className="card">
       <h2>この月の発行済請求書</h2>
+      {/* 過去にinvoicesが同期対象から漏れていた時期に発行した請求書は、
+          取引側の記録だけが残って一覧から消えている。見つかった場合だけ復元を案内する。 */}
+      {orphanInvoices.length>0 && (
+        <div style={{background:"#FFF2CC",border:"1px solid #D9A400",padding:10,borderRadius:4,marginBottom:10}}>
+          <div style={{fontSize:12,marginBottom:6}}>
+            ⚠ 発行済みの記録が残っているのに、請求書が一覧から失われている分が <strong>{orphanInvoices.length}件</strong> あります
+            （{orphanInvoices.map(g=>g.invoiceNo).join("、")}）。
+            取引側には請求済みとして残っているため、一覧に履歴として戻せます。
+          </div>
+          <button className="btn btn-primary btn-sm" onClick={restoreOrphanInvoices}>失われた請求書を復元する</button>
+        </div>
+      )}
       {monthInvoices.length===0 && <p style={{color:"#999",padding:10}}>この月の発行済請求書はありません</p>}
       <table>
-        <thead><tr><th>請求No.</th><th>お客様</th><th className="text-right">税込合計</th><th>状態</th><th>発行日時</th><th></th></tr></thead>
+        <thead><tr><th>請求No.</th><th>お客様</th><th className="text-right">税込合計</th><th>状態</th><th>発行方法</th><th>発行日時</th><th></th></tr></thead>
         <tbody>
           {monthInvoices.map(inv=>{
             const c = data.partners.find(p=>p.id===inv.customerId);
-            return <tr key={inv.id}>
+            const cancelled = inv.status==="cancelled";
+            return <tr key={inv.id} style={cancelled?{color:"#999"}:undefined}>
               <td>{inv.invoiceNo}</td>
               <td>{c?.name||"-"}</td>
-              <td className="text-right price">{yen(inv.total)}</td>
-              <td><span className="badge badge-invoiced">{inv.status==="reissued"?"再発行":"発行済"}</span></td>
+              <td className="text-right price" style={cancelled?{color:"#999",textDecoration:"line-through"}:undefined}>{yen(inv.total)}</td>
+              <td>
+                {cancelled
+                  ? <span className="badge badge-orange">取消済</span>
+                  : <span className="badge badge-invoiced">{inv.status==="reissued"?"再発行":"発行済"}</span>}
+                {cancelled && inv.cancelReason && <div style={{fontSize:10}}>理由: {inv.cancelReason}</div>}
+              </td>
+              <td style={{fontSize:11}}>
+                {inv.issueMethod==="pdf"
+                  ? (inv.pdfUrl ? <a href={inv.pdfUrl} target="_blank" rel="noreferrer">PDF（ドライブ）</a> : "PDF")
+                  : (inv.freeeInvoiceId ? `freee (ID:${inv.freeeInvoiceId})` : "-")}
+              </td>
               <td>{inv.issuedAt ? new Date(inv.issuedAt).toLocaleString('ja-JP') : "-"}</td>
-              <td><button className="btn btn-danger btn-sm" onClick={()=>setCancelTarget(inv)}>取消</button></td>
+              <td>
+                {/* 金額や数量を直す場合は「取消」→内容を直す→もう一度発行、の順。
+                    発行済みの請求書そのものを書き換えないのは、請求済み数量との整合が崩れるため。 */}
+                {!cancelled && <>
+                  <button className="btn btn-secondary btn-sm" disabled={issuingPdf}
+                    onClick={()=>reissueInvoicePdf(inv)}>PDF出し直し</button>
+                  <button className="btn btn-danger btn-sm" style={{marginLeft:4}} onClick={()=>setCancelTarget(inv)}>取消</button>
+                </>}
+                {cancelled && <span style={{fontSize:10}}>取消済（再発行すると新しい請求Noになります）</span>}
+              </td>
             </tr>;
           })}
         </tbody>
