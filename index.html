@@ -5554,8 +5554,25 @@ function FreightRatesTab({data,update}){
     <div className="card">
       <div className="flex-between" style={{marginBottom:12}}>
         <h2 style={{border:"none",padding:0}}>運賃マスタ ({list.length}行) 運送会社×納品先</h2>
-        <button className="btn btn-primary" disabled={carriers.length===0||dests.length===0}
-          onClick={()=>setEditing({carrierId:"",destinationId:"",rateType:"perCase",unitPrice:0,startDate:today(),endDate:"",note:""})}>＋ 新規</button>
+        {/* 運送会社・納品先が未登録のままモーダルを開いても選択肢が空で登録できないため事前に案内する。
+            以前はこのボタンを disabled にしていたが、押しても何も起きず理由が分からないという
+            指摘があったため(2026-09-04)、押せる状態にして不足しているものを具体的に伝える形にした。 */}
+        <button className="btn btn-primary"
+          onClick={()=>{
+            const missing = [];
+            if (carriers.length===0) missing.push(
+              "【1】運送会社が1社も登録されていません\n"+
+              "　「取引先マスタ」タブでその運送会社を開き、\n"+
+              "　「運送会社（出荷の配送をお願いする）」にチェックを入れて保存してください。\n"+
+              "　その会社がまだ取引先に無い場合は、先に取引先として新規登録してください。");
+            if (dests.length===0) missing.push(
+              "【2】納品先が1件も登録されていません\n"+
+              "　「取引先マスタ」タブでお客様を開き、下の方にある\n"+
+              "　「＋ 納品先追加」から登録してください。\n"+
+              "　※納品先は取引先をいったん保存した後でないと追加できません。");
+            if (missing.length) { alert("運賃を登録する前に、次の準備が必要です。\n\n"+missing.join("\n\n")); return; }
+            setEditing({carrierId:"",destinationId:"",rateType:"perCase",unitPrice:0,startDate:today(),endDate:"",note:""});
+          }}>＋ 新規</button>
       </div>
       <p style={{fontSize:11,color:"#666",marginBottom:10}}>
         💡 ここに登録しておくと、納品タブの出荷登録で「運賃を別途請求する」にチェックを入れて運送会社と納品先を選んだとき、運賃が自動で入ります。
