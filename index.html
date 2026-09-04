@@ -684,6 +684,27 @@ function itemSummary(items, products) {
   return names.slice(0,2).join("、") + " 他" + (names.length-2) + "品";
 }
 
+// ---- 取引一覧の「品目」列用: itemSummaryと同じ並び順で、商品名の右に数量(と単位)も表示する。
+// 明細が多い取引で行が縦に伸びすぎないよう、先頭3件までを1行ずつ出し、残りは「他N品」にまとめる。
+// 単位は明細に入っていればそれを、無ければ商品マスタの単位を使う(帳票側と同じ優先順位)。 ----
+function itemSummaryWithQty(items, products) {
+  if (!items || items.length === 0) return "-";
+  const MAX = 3;
+  const lines = items.slice(0, MAX).map((it, i) => {
+    const p = products.find(x => x.id === it.productId);
+    const name = p ? p.name : "?";
+    const qty = Number(it.qty) || 0;
+    const unit = it.unit || p?.unit || "";
+    return <div key={i} style={{whiteSpace:"nowrap"}}>
+      {name} <strong>{qty.toLocaleString()}</strong>{unit && <span style={{color:"#666"}}>{unit}</span>}
+    </div>;
+  });
+  if (items.length > MAX) {
+    lines.push(<div key="more" style={{color:"#666"}}>他{items.length - MAX}品</div>);
+  }
+  return <React.Fragment>{lines}</React.Fragment>;
+}
+
 function findPrice(prices, partnerId, productId, sanchi, date, priceType) {
   const dt = new Date(date);
   const matched = (prices||[]).filter(p =>
@@ -1888,7 +1909,7 @@ function TransactionsTab({data,update}){
       <table>
         <thead><tr>
           <th>取引No.</th><th>日付</th><th>お客様(受注)</th><th>仕入先(発注)</th><th>産地</th>
-          <th>品目</th><th>納品予定日</th>
+          <th>品目・数量</th><th>納品予定日</th>
           <th className="text-right">受注合計</th>
           <th className="text-right">発注合計</th>
           <th className="text-right">粗利</th>
@@ -1905,7 +1926,7 @@ function TransactionsTab({data,update}){
               <td>{c?.name||"-"}</td>
               <td>{s?.name||"-"}</td>
               <td>{t.sanchi}</td>
-              <td style={{fontSize:11}}>{itemSummary(t.items, data.products)}</td>
+              <td style={{fontSize:11,lineHeight:1.5}}>{itemSummaryWithQty(t.items, data.products)}</td>
               <td>{t.plannedDeliveryDate?fmtDate(t.plannedDeliveryDate):"-"}</td>
               <td className="text-right price">{yen(t.totalSaleAmount)}</td>
               <td className="text-right price">{yen(t.totalPurchaseAmount)}</td>
