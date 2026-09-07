@@ -157,11 +157,11 @@ const INITIAL_DATA = {
   "freeeErrorLog": []
 };
 
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 
 // 画面ヘッダーに出すビルド版数。改修したら必ずここを更新すること。
 // 「更新版を開けているか」をブラウザのキャッシュに惑わされず確認するための目印。
-const BUILD_LABEL = "2026-09-05 版";
+const BUILD_LABEL = "2026-09-07 版";
 
 // 旧データ(v1)を新形式(v2/v3/v4/v5/v6/v7/v8)へ移行する。既存フィールドの欠損補完のみ行い、
 // 既にある値は絶対に上書きしない。v1→v8を1回のmigrateData()呼び出しで
@@ -384,6 +384,18 @@ function migrateData(raw) {
     ...s,
     freightSeparate: s.freightSeparate ?? (Number(s.freightAmount||0) > 0),
     carrierId: s.carrierId ?? null,
+  }));
+  // ---- v13マイグレーション: 納品書PDFの発行記録を取引に持たせる ----
+  // 「納品✓(全量)」した取引から納品書PDFを発行できるようにしたので、発行済みかどうかと
+  // ドライブ上のPDFの場所を取引に残す。請求(invoices)とは無関係で、請求済み判定には一切使わない。
+  // 分納した取引(shipmentレコードあり)は出荷ごとに納品書を出すため、ここは常に空のままになる。
+  if (fromVersion < 13) d.meta.migratedAtV13 = new Date().toISOString();
+  d.transactions = (d.transactions || []).map(t => ({
+    ...t,
+    deliveryNoteNo: t.deliveryNoteNo ?? null,
+    deliveryNoteIssuedAt: t.deliveryNoteIssuedAt ?? null,
+    deliveryNotePdfName: t.deliveryNotePdfName ?? null,
+    deliveryNotePdfUrl: t.deliveryNotePdfUrl ?? null,
   }));
   d.meta.schemaVersion = SCHEMA_VERSION;
   d.meta.appKey = APP_KEY;
@@ -691,14 +703,41 @@ function itemSummary(items, products) {
 // ---- 取引一覧の「品目」列用: itemSummaryと同じ並び順で、商品名の右に数量(と単位)も表示する。
 // 明細が多い取引で行が縦に伸びすぎないよう、先頭3件までを1行ずつ出し、残りは「他N品」にまとめる。
 // 単位は明細に入っていればそれを、無ければ商品マスタの単位を使う(帳票側と同じ優先順位)。 ----
-function itemSummaryWithQty(items, products) {
+// showDelivered を付けると、納品済数量が受注数量と違う明細だけ「(納品 4)」を後ろに足す。
+// 納品タブのように「いくつ頼まれて、いくつ納めたか」が知りたい場面で使う。
+function itemSummaryWithQty(items, products, opts) {
   if (!items || items.length === 0) return "-";
+  const showDelivered = !!(opts && opts.showDelivered);
   const MAX = 3;
   const lines = items.slice(0, MAX).map((it, i) => {
     const p = products.find(x => x.id === it.productId);
     const name = p ? p.name : "?";
     const qty = Number(it.qty) || 0;
     const unit = it.unit || p?.unit || "";
+    const delivered = Number(it.deliveredQty) || 0;
+    return <div key={i} style={{whiteSpace:"nowrap"}}>
+      {name} <strong>{qty.toLocaleString()}</strong>{unit && <span style={{color:"#666"}}>{unit}</span>}
+      {showDelivered && delivered !== qty &&
+        <span style={{color:"#B45309"}}>（納品 {delivered.toLocaleString()}）</span>}
+    </div>;
+  });
+  if (items.length > MAX) {
+    lines.push(<div key="more" style={{color:"#666"}}>他{items.length - MAX}品</div>);
+  }
+  return <React.Fragment>{lines}</React.Fragment>;
+}
+
+// ---- 発行済請求書の一覧用。請求書レコードのitems(発行時に凍結した明細)から
+// 「品名 数量」を組み立てる。取引の明細と項目名が違う(qtyではなくbilledQty、
+// 単位を持たない、運賃行はproductIdがnull)ので、itemSummaryWithQtyとは別に用意している。 ----
+function invoiceItemSummary(items, products) {
+  if (!items || items.length === 0) return "-";
+  const MAX = 3;
+  const lines = items.slice(0, MAX).map((it, i) => {
+    const p = it.productId ? (products||[]).find(x => x.id === it.productId) : null;
+    const name = it.isFreight ? "運賃" : (p ? p.name : "?");
+    const qty = Number(it.billedQty) || 0;
+    const unit = p?.unit || "";
     return <div key={i} style={{whiteSpace:"nowrap"}}>
       {name} <strong>{qty.toLocaleString()}</strong>{unit && <span style={{color:"#666"}}>{unit}</span>}
     </div>;
@@ -849,11 +888,157 @@ function buildInvoiceHtml({company, customer, invoiceNo, issueDate, dueDate, tar
   ${sub8>0?`<div class="note">※印は軽減税率対象です。</div>`:""}
   </body></html>`;
 }
+
+// ---- 「納品✓(全量)」した取引から納品書の明細を作る。
+// 分納した取引は出荷(shipment)ごとに納品書を出すので buildDeliveryNoteSnapshot を使う。
+// こちらは shipment レコードを持たない「まるごと納品」の取引専用。
+// 数量は明細の deliveredQty(=納品✓で受注数量がそのまま入る)を使い、単価は受注単価を引用する。 ----
+function buildDeliveryNoteLinesFromTx(tx, products){
+  return (tx.items||[]).filter(it=>Number(it.deliveredQty)>0).map(it=>{
+    const p = (products||[]).find(x=>x.id===it.productId);
+    const qty = Number(it.deliveredQty)||0;
+    const unitPrice = Number(it.salePrice)||0;
+    return {
+      productName: p?.name||"?", unit: it.unit||p?.unit||"",
+      qty, unitPrice, amount: qty*unitPrice,
+      taxRate: p?.taxRate===0.08 ? 0.08 : 0.10,
+      transactionDate: tx.transactionDate, sanchi: tx.sanchi,
+    };
+  });
+}
+// ---- 明細から税率別の小計・消費税・合計を出す(請求書の集計と同じ計算)。 ----
+function sumDeliveryNoteLines(lines){
+  const subtotalByTaxRate = {"0.08":0, "0.10":0};
+  (lines||[]).forEach(l=>{ subtotalByTaxRate[Number(l.taxRate).toFixed(2)] += Number(l.amount)||0; });
+  const taxByTaxRate = {
+    "0.08": Math.floor(subtotalByTaxRate["0.08"]*0.08),
+    "0.10": Math.floor(subtotalByTaxRate["0.10"]*0.10),
+  };
+  const subtotal = subtotalByTaxRate["0.08"] + subtotalByTaxRate["0.10"];
+  const taxTotal = taxByTaxRate["0.08"] + taxByTaxRate["0.10"];
+  return {subtotalByTaxRate, taxByTaxRate, subtotal, taxTotal, total: subtotal+taxTotal};
+}
+
+// ---- 納品書PDF用のHTML。体裁は請求書(buildInvoiceHtml)に合わせてある。
+// 請求書と違い「請求金額」「入金期日」「振込先」の枠は出さない(まだ請求ではないため)。
+// 会社情報の読み方(companyName/name の二重綴り対応)も請求書と揃えてある。 ----
+function buildDeliveryNoteHtml({company, customer, destination, deliveryNoteNo, deliveryDate, transactionNo, lines, subtotalByTaxRate, taxByTaxRate, total}){
+  const cs = company || {};
+  const co = {
+    name: cs.companyName || cs.name || "",
+    zip: cs.companyZip || cs.zip || "",
+    address: cs.companyAddress || cs.address || "",
+    tel: cs.companyTel || cs.tel || "",
+    fax: cs.companyFax || cs.fax || "",
+    registrationNumber: cs.invoiceRegistrationNumber || cs.registrationNumber || "",
+    personInCharge: cs.representativeName || cs.personInCharge || "",
+  };
+  const tekiyo = (l)=>{
+    const sanchi = l.sanchi ? `　${l.sanchi}県産` : "";
+    return `${l.productName||""}${sanchi}${l.taxRate===0.08?" ※":""}`;
+  };
+  const row = (l)=>`<tr>
+    <td>${escapeHtml(tekiyo(l))}</td>
+    <td class="r nowrap">${escapeHtml(l.qty)}${l.unit?` ${escapeHtml(l.unit)}`:""}</td>
+    <td class="r">${Number(l.unitPrice||0).toLocaleString()}</td>
+    <td class="r">${Number(l.amount||0).toLocaleString()}</td>
+  </tr>`;
+  const sub8 = Number(subtotalByTaxRate["0.08"]||0), sub10 = Number(subtotalByTaxRate["0.10"]||0);
+  const tax8 = Number(taxByTaxRate["0.08"]||0), tax10 = Number(taxByTaxRate["0.10"]||0);
+  const regNo = co.registrationNumber ? (/^[Tt]/.test(co.registrationNumber)?co.registrationNumber:"T"+co.registrationNumber) : "";
+  const infoRow = (lbl,val)=>val?`<tr><th>${escapeHtml(lbl)}</th><td>${val}</td></tr>`:"";
+  const destLine = destination ? [destination.name, destination.address].filter(Boolean).join("　") : "";
+  return `<!doctype html><html lang="ja"><head><meta charset="UTF-8"><style>
+  *{box-sizing:border-box}
+  body{font-family:"Yu Gothic","Meiryo",sans-serif;font-size:11pt;color:#000;margin:0;padding:18mm 15mm}
+  h1{font-size:19pt;text-align:center;letter-spacing:8px;margin:0 0 18px;font-weight:bold}
+  .head{display:flex;justify-content:space-between;gap:24px;margin-bottom:16px}
+  .to{width:50%}
+  .to .name{font-size:13.5pt;font-weight:bold;border-bottom:1px solid #000;padding-bottom:5px}
+  .to .lead{font-size:9.5pt;margin-top:10px}
+  .from{width:46%;font-size:9pt;line-height:1.65;text-align:left}
+  .from .co{font-size:12pt;font-weight:bold;margin-bottom:3px}
+  .info{width:100%;border-collapse:collapse;font-size:9pt;margin-bottom:10px}
+  .info th{width:78px;text-align:left;font-weight:normal;color:#333;padding:2px 0;border:none}
+  .info td{padding:2px 0;border:none}
+  .claim{border:1px solid #000;margin-bottom:14px}
+  .claim table{width:100%;border-collapse:collapse;font-size:10pt}
+  .claim th{width:86px;background:#F2F2F2;border:1px solid #000;padding:6px 8px;text-align:left;font-weight:bold}
+  .claim td{border:1px solid #000;padding:6px 8px}
+  .claim .amount{font-size:16pt;font-weight:bold}
+  h2.sec{font-size:10.5pt;margin:0 0 6px;padding-bottom:3px;border-bottom:1px solid #000}
+  table.detail{width:100%;border-collapse:collapse;font-size:9pt}
+  table.detail th,table.detail td{border:1px solid #666;padding:5px 6px}
+  table.detail th{background:#F2F2F2;font-weight:bold;text-align:center}
+  td.r{text-align:right}
+  .nowrap{white-space:nowrap}
+  .sums{width:56%;margin-left:auto;margin-top:10px;border-collapse:collapse;font-size:9.5pt}
+  .sums td{padding:4px 8px;border-bottom:1px solid #CCC}
+  .sums td.r{text-align:right}
+  .sums tr.grand td{border-top:2px solid #000;border-bottom:none;font-size:11pt;font-weight:bold;padding-top:6px}
+  .note{margin-top:10px;font-size:8.5pt;color:#333}
+  </style></head><body>
+  <h1>納 品 書</h1>
+  <div class="head">
+    <div class="to">
+      <div class="name">${escapeHtml(customer.formalName || customer.name)}</div>
+      <div class="lead">下記の通り納品いたしました。</div>
+      <table class="info" style="margin-top:10px">
+        ${infoRow("納品日", escapeHtml(deliveryDate||""))}
+        ${infoRow("納品書番号", escapeHtml(deliveryNoteNo||""))}
+        ${infoRow("取引番号", escapeHtml(transactionNo||""))}
+        ${infoRow("納品先", escapeHtml(destLine))}
+      </table>
+    </div>
+    <div class="from">
+      <div class="co">${escapeHtml(co.name||"")}</div>
+      ${regNo?`登録番号　${escapeHtml(regNo)}<br>`:""}
+      ${co.zip?`〒${escapeHtml(co.zip)}<br>`:""}
+      ${co.address?`${escapeHtml(co.address)}<br>`:""}
+      ${co.tel?`TEL ${escapeHtml(co.tel)}${co.fax?`　FAX ${escapeHtml(co.fax)}`:""}<br>`:""}
+      ${co.personInCharge?`担当　${escapeHtml(co.personInCharge)}`:""}
+    </div>
+  </div>
+
+  <div class="claim">
+    <table>
+      <tr><th>納品金額</th><td class="amount">${Number(total||0).toLocaleString()}円</td></tr>
+      <tr><th>備考</th><td>&nbsp;</td></tr>
+    </table>
+  </div>
+
+  <h2 class="sec">内訳</h2>
+  <table class="detail">
+    <thead><tr><th>品名</th><th style="width:15%">数量</th><th style="width:15%">単価</th><th style="width:18%">金額</th></tr></thead>
+    <tbody>${lines.map(row).join("")}</tbody>
+  </table>
+
+  <table class="sums">
+    <tr><td>小計</td><td class="r">${(sub8+sub10).toLocaleString()}円</td></tr>
+    ${sub8>0?`<tr><td>軽減税率8%対象(税抜)</td><td class="r">${sub8.toLocaleString()}円</td></tr>
+    <tr><td>軽減税率8%消費税</td><td class="r">${tax8.toLocaleString()}円</td></tr>`:""}
+    ${sub10>0?`<tr><td>10%対象(税抜)</td><td class="r">${sub10.toLocaleString()}円</td></tr>
+    <tr><td>10%消費税</td><td class="r">${tax10.toLocaleString()}円</td></tr>`:""}
+    <tr><td>消費税</td><td class="r">${(tax8+tax10).toLocaleString()}円</td></tr>
+    <tr class="grand"><td>納品金額</td><td class="r">${Number(total||0).toLocaleString()}円</td></tr>
+  </table>
+  ${sub8>0?`<div class="note">※印は軽減税率対象です。</div>`:""}
+  <div class="note">この納品書は請求書ではありません。ご請求は別途、月次の請求書にてご案内いたします。</div>
+  </body></html>`;
+}
 // 請求書PDFをGAS経由でGoogleドライブへ保存する。
 // 共有データベースと同じWeb App URL・アクセスコードを使う(別途の設定は不要)。
 // Content-Typeヘッダーは付けない(既存のbackendCallと同じ。付けるとCORSプリフライトに引っかかる)
 async function backendSaveInvoicePdf(config, fileName, subFolder, html){
   const j = await backendCall(config, {action:"saveInvoicePdf", fileName, subFolder, html});
+  if (!j || !j.ok) throw new Error((j && j.error) || "PDFの保存に失敗しました");
+  return j.result;
+}
+// 納品書PDFの保存。請求書と同じGASのsaveInvoicePdfを使い、rootFolderで保存先だけ変える。
+// rootFolderに未対応の古いGASでも保存自体は成功する(その場合は「請求書PDF」配下に入る)。
+// ファイル名に必ず「納品書」を含めているので、混ざっても見分けはつく。
+async function backendSaveDeliveryNotePdf(config, fileName, subFolder, html){
+  const j = await backendCall(config, {action:"saveInvoicePdf", fileName, subFolder, html, rootFolder:"納品書PDF"});
   if (!j || !j.ok) throw new Error((j && j.error) || "PDFの保存に失敗しました");
   return j.result;
 }
@@ -1636,7 +1821,7 @@ function App(){
       {tab==="dashboard" && <Dashboard data={data}/>}
       {tab==="quotations" && <QuotationsTab data={data} update={update}/>}
       {tab==="transactions" && <TransactionsTab data={data} update={update}/>}
-      {tab==="deliveries" && <DeliveriesTab data={data} update={update}/>}
+      {tab==="deliveries" && <DeliveriesTab data={data} update={update} backendConfig={backendConfig}/>}
       {tab==="invoicing" && <InvoicingTab data={data} update={update} freeeConfig={freeeConfig} backendConfig={backendConfig} onNeedConfig={()=>setShowFreeeConfig(true)}/>}
       {tab==="processing" && <ProcessingTab data={data} update={update}/>}
       {tab==="inventory" && <InventoryTab data={data} update={update}/>}
@@ -2324,9 +2509,11 @@ function AllocationModal({transaction,item,data,update,onClose}){
 // ================================================================
 // 納品タブ (取引と連動)
 // ================================================================
-function DeliveriesTab({data,update}){
+function DeliveriesTab({data,update,backendConfig}){
   const [filter,setFilter] = useState("all"); // all / pending(created) / done(delivered)
   const [shipModalTx,setShipModalTx] = useState(null); // 明細ごとの出荷/納品入力モーダルの対象取引
+  const [noteTx,setNoteTx] = useState(null);           // 納品書の発行方法を選ぶモーダルの対象取引
+  const [issuingNote,setIssuingNote] = useState(false); // 納品書PDFの発行中(二重クリック防止)
   let txs = (data.transactions||[]).sort((a,b)=>b.transactionDate.localeCompare(a.transactionDate));
   txs = txs.filter(t=>t.status!=="cancelled");
   if (filter==="pending") txs = txs.filter(t=>t.status==="created"||t.status==="partial_delivered");
@@ -2364,6 +2551,49 @@ function DeliveriesTab({data,update}){
     });
   };
 
+  // ---- 納品書PDF発行(Googleドライブへ保存)。「納品✓(全量)」で納品済にした取引が対象。
+  // 分納した取引は出荷1回ごとに納品書を出すので「明細ごとに入力」→出荷履歴の「納品書印刷」を使う。
+  // 数量・単価は発行時点の取引内容から作る。請求とは無関係で、請求済み扱いには一切しない
+  // (何度出し直しても二重請求にはならない)。納品書番号は取引番号から決まるので出し直しても変わらない。 ----
+  const issueDeliveryNotePdf = async (tx) => {
+    if (!backendConfig || !backendConfig.enabled || !backendConfig.url) {
+      alert("納品書PDFの保存には共有データベースの接続が必要です。\n設定タブで共有データベースを有効にしてから、もう一度お試しください。");
+      return;
+    }
+    const customer = data.partners.find(p=>p.id===tx.customerId);
+    if (!customer) { alert("お客様が見つかりません。"); return; }
+    const lines = buildDeliveryNoteLinesFromTx(tx, data.products);
+    if (lines.length===0) { alert("納品済の数量がないため納品書を発行できません。"); return; }
+    const sums = sumDeliveryNoteLines(lines);
+    const dest = (data.deliveryDestinations||[]).find(dd=>dd.id===tx.deliveryDestinationId) || null;
+    const deliveryNoteNo = "DN-"+tx.transactionNo;
+    const deliveryDate = tx.deliveredDate || today();
+    setIssuingNote(true);
+    try {
+      const html = buildDeliveryNoteHtml({
+        company: data.meta?.companySettings||{}, customer, destination: dest,
+        deliveryNoteNo, deliveryDate, transactionNo: tx.transactionNo, lines,
+        subtotalByTaxRate: sums.subtotalByTaxRate, taxByTaxRate: sums.taxByTaxRate, total: sums.total,
+      });
+      const fileName = `${customer.name}_${deliveryNoteNo}_納品書`;
+      const saved = await backendSaveDeliveryNotePdf(backendConfig, fileName, (deliveryDate||"").slice(0,7), html);
+      await update(d=>{
+        const before = d.transactions.find(x=>x.id===tx.id);
+        const after = {...before, deliveryNoteNo, deliveryNoteIssuedAt:new Date().toISOString(),
+          deliveryNotePdfName:saved.name, deliveryNotePdfUrl:saved.url};
+        d.transactions = d.transactions.map(x=>x.id===tx.id?after:x);
+        d = addAuditLog(d, {action:"update", targetType:"transaction", targetId:tx.id, before, after, reason:"納品書PDF発行"});
+        return d;
+      });
+      setNoteTx(null);
+      if (confirm(`納品書PDFを保存しました。\n\n納品書番号: ${deliveryNoteNo}\nファイル: ${saved.name}\n\nドライブで開きますか？`)) {
+        window.open(saved.url, "_blank");
+      }
+    } catch(err) {
+      alert("納品書PDFの発行に失敗しました:\n"+(err.message||err));
+    } finally { setIssuingNote(false); }
+  };
+
   const STATUS_LABEL = {created:"納品予定",partial_delivered:"一部納品",delivered:"納品✓済",invoiced:"請求済"};
 
   return (
@@ -2380,7 +2610,7 @@ function DeliveriesTab({data,update}){
       <table>
         <thead><tr>
           <th>取引No.</th><th>取引日</th><th>お客様</th><th>産地</th>
-          <th>品目</th><th className="text-right">金額</th><th>納品状態</th><th>納品日</th><th></th>
+          <th>品目・数量</th><th className="text-right">金額</th><th>納品状態</th><th>納品日</th><th>納品書</th><th></th>
         </tr></thead>
         <tbody>
           {txs.map(t=>{
@@ -2391,10 +2621,21 @@ function DeliveriesTab({data,update}){
               <td>{fmtDate(t.transactionDate)}</td>
               <td>{c?.name||"-"}</td>
               <td>{t.sanchi}</td>
-              <td style={{fontSize:11}}>{itemSummary(t.items, data.products)}</td>
+              <td style={{fontSize:11,lineHeight:1.5}}>{itemSummaryWithQty(t.items, data.products, {showDelivered:true})}</td>
               <td className="text-right price">{yen(t.totalSaleAmount)}</td>
               <td><span className={"badge badge-"+t.status}>{STATUS_LABEL[t.status]||t.status}</span></td>
               <td>{t.deliveredDate?fmtDate(t.deliveredDate):"-"}</td>
+              {/* 納品書は「納品✓(全量)」で納品済にした取引だけここから出す。
+                  分納(出荷レコードあり)の取引は出荷1回ごとに納品書が要るので
+                  「明細ごとに入力」→出荷履歴の「納品書印刷」へ誘導する。 */}
+              <td style={{fontSize:11}}>
+                {!shipped && (t.status==="delivered"||t.status==="invoiced") ? <>
+                  <button className="btn btn-secondary btn-sm" onClick={()=>setNoteTx(t)}>納品書を発行</button>
+                  {t.deliveryNotePdfUrl && <div style={{marginTop:3}}>
+                    <a href={t.deliveryNotePdfUrl} target="_blank" rel="noreferrer">発行済PDF</a>
+                  </div>}
+                </> : shipped ? <span style={{color:"#888"}}>出荷ごとに発行</span> : <span style={{color:"#888"}}>-</span>}
+              </td>
               <td>
                 {t.status!=="invoiced" && <button className="btn btn-secondary btn-sm" onClick={()=>setShipModalTx(t)}>明細ごとに入力</button>}
                 {!shipped && t.status==="created" && <button className="btn btn-success btn-sm" style={{marginLeft:4}} onClick={()=>markDelivered(t.id)}>納品✓(全量)</button>}
@@ -2406,6 +2647,66 @@ function DeliveriesTab({data,update}){
         </tbody>
       </table>
       {shipModalTx && <ShipmentEntryModal transaction={shipModalTx} data={data} update={update} onClose={()=>setShipModalTx(null)}/>}
+      {noteTx && <DeliveryNoteIssueModal tx={noteTx} data={data} issuing={issuingNote}
+        onIssuePdf={()=>issueDeliveryNotePdf(noteTx)} onClose={()=>!issuingNote && setNoteTx(null)}/>}
+    </div>
+  );
+}
+
+// ---- 納品書の発行方法を選ぶモーダル(PDF発行 / freee発行)。
+// freee発行は未接続。freee請求書APIの POST /iv/delivery_slips は生きているが(2026-09-07 時点で
+// 認証エラー401が返る=エンドポイントは存在する)、送信内容の仕様を確認できておらず、
+// 実データで試せる状態にないため、押した時点では手順の案内だけを出す。
+// アプリが今使っている freee会計の POST /api/1/invoices は廃止済み(404)である点にも注意。 ----
+function DeliveryNoteIssueModal({tx,data,issuing,onIssuePdf,onClose}){
+  const customer = data.partners.find(p=>p.id===tx.customerId);
+  const lines = buildDeliveryNoteLinesFromTx(tx, data.products);
+  const sums = sumDeliveryNoteLines(lines);
+  const deliveryNoteNo = "DN-"+tx.transactionNo;
+  const freeeNotReady = () => {
+    alert(
+      "freeeへの納品書発行は、まだ接続の設定ができていません。\n\n"+
+      "freee請求書の納品書APIは利用できることまでは確認できていますが、\n"+
+      "送信内容の仕様を確認して実データで試す必要があります。\n\n"+
+      "それまでは「納品書PDF発行」をお使いください。\n"+
+      "内容は同じで、Googleドライブの「納品書PDF」フォルダに保存されます。"
+    );
+  };
+  return (
+    <div className="modal-bg" onClick={onClose}>
+      <div className="modal" style={{width:640}} onClick={e=>e.stopPropagation()}>
+        <h3>納品書の発行 ({tx.transactionNo})</h3>
+        <div style={{fontSize:12,lineHeight:1.9,marginBottom:10}}>
+          <div><span style={{color:"#666",display:"inline-block",width:90}}>お客様</span>{customer?.name||"-"}</div>
+          <div><span style={{color:"#666",display:"inline-block",width:90}}>納品日</span>{tx.deliveredDate?fmtDate(tx.deliveredDate):fmtDate(today())}</div>
+          <div><span style={{color:"#666",display:"inline-block",width:90}}>納品書番号</span>{deliveryNoteNo}</div>
+        </div>
+        <table style={{marginBottom:10}}>
+          <thead><tr><th>品名</th><th className="text-right">数量</th><th className="text-right">単価</th><th className="text-right">金額</th></tr></thead>
+          <tbody>
+            {lines.map((l,i)=><tr key={i}>
+              <td style={{fontSize:11}}>{l.productName}</td>
+              <td className="text-right">{l.qty.toLocaleString()}{l.unit}</td>
+              <td className="text-right price">{yen(l.unitPrice)}</td>
+              <td className="text-right price">{yen(l.amount)}</td>
+            </tr>)}
+            {lines.length===0 && <tr><td colSpan={4} style={{color:"#888",fontSize:12}}>納品済の数量がありません</td></tr>}
+          </tbody>
+        </table>
+        <div style={{textAlign:"right",fontSize:13,marginBottom:12}}>
+          税抜 {yen(sums.subtotal)}　消費税 {yen(sums.taxTotal)}　<strong>税込 {yen(sums.total)}</strong>
+        </div>
+        <p style={{fontSize:11,color:"#666",marginBottom:12}}>
+          💡 納品書の発行は請求とは無関係です。何度出し直しても請求済みにはなりませんし、二重請求にもなりません。
+        </p>
+        <div className="flex" style={{justifyContent:"flex-end",gap:8}}>
+          <button className="btn btn-secondary" onClick={onClose} disabled={issuing}>キャンセル</button>
+          <button className="btn btn-secondary" onClick={freeeNotReady} disabled={issuing}>納品書発行(freee)</button>
+          <button className="btn btn-primary" onClick={onIssuePdf} disabled={issuing||lines.length===0}>
+            {issuing?"発行中...":"納品書PDF発行"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -3683,7 +3984,7 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
       )}
       {monthInvoices.length===0 && <p style={{color:"#999",padding:10}}>この月の発行済請求書はありません</p>}
       <table>
-        <thead><tr><th>請求No.</th><th>お客様</th><th className="text-right">税込合計</th><th>状態</th><th>発行方法</th><th>発行日時</th><th></th></tr></thead>
+        <thead><tr><th>請求No.</th><th>お客様</th><th>品目・数量</th><th className="text-right">税込合計</th><th>状態</th><th>発行方法</th><th>発行日時</th><th></th></tr></thead>
         <tbody>
           {monthInvoices.map(inv=>{
             const c = data.partners.find(p=>p.id===inv.customerId);
@@ -3691,6 +3992,8 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
             return <tr key={inv.id} style={cancelled?{color:"#999"}:undefined}>
               <td>{inv.invoiceNo}</td>
               <td>{c?.name||"-"}</td>
+              {/* 請求書に載せた明細(発行時に凍結したもの)。運賃行は商品IDを持たないので「運賃」と出す。 */}
+              <td style={{fontSize:11,lineHeight:1.5}}>{invoiceItemSummary(inv.items, data.products)}</td>
               <td className="text-right price" style={cancelled?{color:"#999",textDecoration:"line-through"}:undefined}>{yen(inv.total)}</td>
               <td>
                 {cancelled
