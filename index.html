@@ -159,6 +159,10 @@ const INITIAL_DATA = {
 
 const SCHEMA_VERSION = 12;
 
+// 画面ヘッダーに出すビルド版数。改修したら必ずここを更新すること。
+// 「更新版を開けているか」をブラウザのキャッシュに惑わされず確認するための目印。
+const BUILD_LABEL = "2026-09-05 版";
+
 // 旧データ(v1)を新形式(v2/v3/v4/v5/v6/v7/v8)へ移行する。既存フィールドの欠損補完のみ行い、
 // 既にある値は絶対に上書きしない。v1→v8を1回のmigrateData()呼び出しで
 // 連続して適用できるよう、fromVersion<2 / fromVersion<3 / fromVersion<4 / fromVersion<5 / fromVersion<6 / fromVersion<7 / fromVersion<8 の各ブロックを全て保持する。
@@ -1584,7 +1588,9 @@ function App(){
 
   return (<>
     <header className="no-print">
-      <h1>{data.meta?.app || "川上荷役 農産物・加工 v3"}</h1>
+      <h1>{data.meta?.app || "川上荷役 農産物・加工 v3"}
+        <span style={{fontSize:11,fontWeight:"normal",opacity:0.75,marginLeft:8}}>{BUILD_LABEL}</span>
+      </h1>
       <div className="actions">
         {syncStatus==="connected" && <span className="badge-sync">● 自動保存中</span>}
         {backendConfig.enabled && <span className="badge-backend" title={lastSyncTime?`最終同期: ${lastSyncTime.toLocaleString('ja-JP')}`:""}>● 共有DB同期中</span>}
@@ -3050,6 +3056,9 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
           id: invoiceId, invoiceNo, customerId, targetMonth: selectedMonth,
           txIds, items: invoiceLineItems, issuedAt: now, status: original ? "reissued" : "issued",
           subtotalByTaxRate, taxByTaxRate, total,
+          // 請求書に印字した請求日(対象月の末日)と入金期日。
+          // PDFを出し直しても日付が動かないよう、発行した時点の値をここに残す。
+          issueDate, dueDate,
           cancelReason:null, cancelledAt:null, cancelledBy:null,
           originalInvoiceId: original ? original.id : null,
           // PDF発行はfreeeへ送っていないので、freee関連は「対象外」として記録する
@@ -3290,13 +3299,15 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
           unitPrice: li.unitPrice, amount: li.amount, taxRate: li.taxRate,
         };
       });
+      // 請求日は発行時に記録したものをそのまま使う(出し直しで日付が動かないようにする)。
+      // issueDateを持たない古い請求書は、発行時と同じ計算(対象月の末日)で求め直す。
       const lastDay = new Date(inv.targetMonth+"-01");
       lastDay.setMonth(lastDay.getMonth()+1);
       lastDay.setDate(0);
-      const issueDate = inv.issuedAt ? inv.issuedAt.slice(0,10) : lastDay.toISOString().slice(0,10);
+      const issueDate = inv.issueDate || lastDay.toISOString().slice(0,10);
       const html = buildInvoiceHtml({
         company: data.meta?.companySettings||{}, customer, invoiceNo: inv.invoiceNo,
-        issueDate, dueDate: calcDueDate(customer, issueDate), targetMonth: inv.targetMonth,
+        issueDate, dueDate: inv.dueDate || calcDueDate(customer, issueDate), targetMonth: inv.targetMonth,
         lines, subtotalByTaxRate: inv.subtotalByTaxRate, taxByTaxRate: inv.taxByTaxRate, total: inv.total,
       });
       const saved = await backendSaveInvoicePdf(backendConfig,
