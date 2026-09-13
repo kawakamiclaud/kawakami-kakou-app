@@ -161,7 +161,7 @@ const SCHEMA_VERSION = 13;
 
 // 画面ヘッダーに出すビルド版数。改修したら必ずここを更新すること。
 // 「更新版を開けているか」をブラウザのキャッシュに惑わされず確認するための目印。
-const BUILD_LABEL = "2026-09-07 版";
+const BUILD_LABEL = "2026-09-13 版";
 
 // 旧データ(v1)を新形式(v2/v3/v4/v5/v6/v7/v8)へ移行する。既存フィールドの欠損補完のみ行い、
 // 既にある値は絶対に上書きしない。v1→v8を1回のmigrateData()呼び出しで
@@ -1877,29 +1877,40 @@ function FreeeConfigModal({config, onSave, onClose}) {
 // ダッシュボード
 // ================================================================
 function Dashboard({data}){
+  // 今期(6月〜翌5月)の取引だけを、月別推移(buildMonthlyTrend)と同じルールで集計する。
+  // 以前は全期間・取消済も含めて足していたため、見出しの「今期」と中身が合っていなかった(2026-09-13修正)。
+  //  ・取消済は除外 ・取引日で年度を判定 ・明細の税抜金額 ・輸出取引の売上は為替レートで円換算
+  //  ・仕入先は明細の仕入先を優先し、無ければ取引の既定の仕入先
+  const currentFy = fiscalYearOf(today());
   const stats = useMemo(()=>{
-    const txs = data.transactions || [];
+    const txs = (data.transactions || []).filter(t =>
+      t.status !== "cancelled" && t.transactionDate && fiscalYearOf(t.transactionDate) === currentFy);
     let totalSale = 0, totalPurchase = 0;
     const byCat = {};
     (data.products||[]).forEach(p=>{ if(p.category && !byCat[p.category]) byCat[p.category]={sale:0,purchase:0}; });
     const byCust = {};
     const bySup = {};
     txs.forEach(t => {
-      totalSale += t.totalSaleAmount || 0;
-      totalPurchase += t.totalPurchaseAmount || 0;
-      byCust[t.customerId] = (byCust[t.customerId]||0) + (t.totalSaleAmount||0);
-      if (t.supplierId) bySup[t.supplierId] = (bySup[t.supplierId]||0) + (t.totalPurchaseAmount||0);
+      const rate = (t.currency||"JPY")!=="JPY" ? Number(t.exchangeRate??1) : 1;
       (t.items||[]).forEach(it => {
+        const s = Math.round((Number(it.saleAmount)||0)*rate);
+        const pu = Number(it.purchaseAmount)||0;
+        totalSale += s;
+        totalPurchase += pu;
+        if (s) byCust[t.customerId] = (byCust[t.customerId]||0) + s;
+        const supId = it.supplierId || t.supplierId;
+        if (pu && supId) bySup[supId] = (bySup[supId]||0) + pu;
         const p = data.products.find(x=>x.id===it.productId);
         if (p && byCat[p.category]) {
-          byCat[p.category].sale += (it.saleAmount||0);
-          byCat[p.category].purchase += (it.purchaseAmount||0);
+          byCat[p.category].sale += s;
+          byCat[p.category].purchase += pu;
         }
       });
     });
     return {totalSale, totalPurchase, gross: totalSale-totalPurchase, byCat, byCust, bySup};
-  },[data]);
+  },[data, currentFy]);
   const rate = stats.totalSale>0 ? (stats.gross/stats.totalSale*100).toFixed(1) : 0;
+  const [showTrend,setShowTrend] = useState(false); // 月別推移(売上・仕入)の表示切替
 
   const txs = data.transactions || [];
   const invoiced = txs.filter(t=>t.status==="invoiced").length;
@@ -1909,14 +1920,23 @@ function Dashboard({data}){
 
   return (<>
     <div className="card">
-      <h2>全体サマリー(今期)</h2>
+      <div className="flex-between" style={{marginBottom:12,paddingBottom:6,borderBottom:"1px solid #EEE"}}>
+        <h2 style={{border:"none",padding:0,margin:0}}>全体サマリー(今期)</h2>
+        <button className={"btn btn-sm "+(showTrend?"btn-secondary":"btn-primary")} onClick={()=>setShowTrend(v=>!v)}>
+          {showTrend ? "月別推移を閉じる" : "📈 月別推移（売上・仕入）"}
+        </button>
+      </div>
+      <p style={{fontSize:11,color:"#666",margin:"-4px 0 10px"}}>
+        {currentFy}年度（{currentFy}年6月〜{currentFy+1}年5月）の取引日で集計・税抜・取消済を除く。カテゴリ別・お客様別・仕入先別も同じ期間です。
+      </p>
       <div className="grid-4">
-        <div className="stat"><div className="value">{yen(stats.totalSale)}</div><div className="label">受注合計(税抜)</div></div>
-        <div className="stat"><div className="value">{yen(stats.totalPurchase)}</div><div className="label">発注合計(税抜)</div></div>
+        <div className="stat"><div className="value">{yen(stats.totalSale)}</div><div className="label">売上合計(税抜)</div></div>
+        <div className="stat"><div className="value">{yen(stats.totalPurchase)}</div><div className="label">仕入合計(税抜)</div></div>
         <div className="stat"><div className="value">{yen(stats.gross)}</div><div className="label">粗利</div></div>
         <div className="stat"><div className="value">{rate}%</div><div className="label">粗利率</div></div>
       </div>
     </div>
+    {showTrend && <MonthlyTrend data={data}/>}
     <div className="card">
       <h2>ステータス</h2>
       <div className="grid-4" style={{gridTemplateColumns:"repeat(5,1fr)"}}>
@@ -1930,7 +1950,7 @@ function Dashboard({data}){
     <div className="card">
       <h2>カテゴリ別収支</h2>
       <table>
-        <thead><tr><th>カテゴリ</th><th className="text-right">受注</th><th className="text-right">発注</th><th className="text-right">粗利</th><th className="text-right">粗利率</th></tr></thead>
+        <thead><tr><th>カテゴリ</th><th className="text-right">売上</th><th className="text-right">仕入</th><th className="text-right">粗利</th><th className="text-right">粗利率</th></tr></thead>
         <tbody>
           {Object.keys(stats.byCat).map(k=>{
             const c = stats.byCat[k]; const g = c.sale - c.purchase; const r = c.sale>0?(g/c.sale*100).toFixed(1):0;
@@ -1945,9 +1965,9 @@ function Dashboard({data}){
     </div>
     <div className="grid-2">
       <div className="card">
-        <h2>お客様別 受注</h2>
+        <h2>お客様別 売上</h2>
         <table>
-          <thead><tr><th>お客様</th><th className="text-right">受注</th></tr></thead>
+          <thead><tr><th>お客様</th><th className="text-right">売上</th></tr></thead>
           <tbody>
             {Object.keys(stats.byCust).sort((a,b)=>stats.byCust[b]-stats.byCust[a]).slice(0,10).map(id=>{
               const p = data.partners.find(x=>x.id===id);
@@ -1957,9 +1977,9 @@ function Dashboard({data}){
         </table>
       </div>
       <div className="card">
-        <h2>仕入先別 発注</h2>
+        <h2>仕入先別 仕入</h2>
         <table>
-          <thead><tr><th>仕入先</th><th className="text-right">発注</th></tr></thead>
+          <thead><tr><th>仕入先</th><th className="text-right">仕入</th></tr></thead>
           <tbody>
             {Object.keys(stats.bySup).sort((a,b)=>stats.bySup[b]-stats.bySup[a]).slice(0,10).map(id=>{
               const p = data.partners.find(x=>x.id===id);
@@ -1970,6 +1990,206 @@ function Dashboard({data}){
       </div>
     </div>
   </>);
+}
+
+// ================================================================
+// 月別推移(売上・仕入) — ダッシュボードの「📈 月別推移」ボタンで開く
+// ================================================================
+// 川上荷役の事業年度は6月〜翌5月(決算5月)。カワカミ蓮根(3月始まり)と取り違えないこと。
+const FISCAL_START_MONTH = 6;
+function fiscalYearOf(dateStr){
+  const [y,m] = String(dateStr||"").split("-").map(Number);
+  return m >= FISCAL_START_MONTH ? y : y-1;
+}
+// 事業年度の12ヶ月を "YYYY-MM" で返す(2026年度 → 2026-06 … 2027-05)
+function fiscalMonths(fy){
+  return Array.from({length:12}, (_,i)=>{
+    const m0 = FISCAL_START_MONTH-1+i;
+    return `${fy+Math.floor(m0/12)}-${String(m0%12+1).padStart(2,"0")}`;
+  });
+}
+// 売上・仕入を月×(取引先/商品)で集計する。
+// ・月は取引日(受注日)で判定。取消済の取引は含めない
+// ・金額は明細の saleAmount / purchaseAmount(税抜)。取引の合計欄は明細の合計なので一致する
+// ・輸出取引は販売金額が外貨建てなので為替レートで円に換算する(仕入は円建て)
+// ・仕入先は明細ごとの仕入先を優先し、無ければ取引の既定の仕入先を使う
+function buildMonthlyTrend(data, fy){
+  const months = fiscalMonths(fy);
+  const idx = {}; months.forEach((m,i)=>{ idx[m]=i; });
+  const zero = () => new Array(12).fill(0);
+  const total = {sale:zero(), purchase:zero()};
+  const saleBy = {partner:{}, product:{}};
+  const purchaseBy = {partner:{}, product:{}};
+  const add = (map,key,i,v) => { if(!map[key]) map[key]=zero(); map[key][i]+=v; };
+  (data.transactions||[]).forEach(t=>{
+    if (t.status==="cancelled" || !t.transactionDate) return;
+    const i = idx[t.transactionDate.slice(0,7)];
+    if (i===undefined) return;
+    const rate = (t.currency||"JPY")!=="JPY" ? Number(t.exchangeRate??1) : 1;
+    (t.items||[]).forEach(it=>{
+      const s = Math.round((Number(it.saleAmount)||0)*rate);
+      const p = Number(it.purchaseAmount)||0;
+      if (s) {
+        total.sale[i] += s;
+        add(saleBy.partner, t.customerId||"", i, s);
+        add(saleBy.product, it.productId||"", i, s);
+      }
+      if (p) {
+        total.purchase[i] += p;
+        add(purchaseBy.partner, it.supplierId||t.supplierId||"", i, p);
+        add(purchaseBy.product, it.productId||"", i, p);
+      }
+    });
+  });
+  return {months, total, saleBy, purchaseBy};
+}
+
+const TREND_SALE_COLOR = "#1F4E79";     // 売上＝青(取引入力画面の受注金額欄と同じ系統)
+const TREND_PURCHASE_COLOR = "#C2410C"; // 仕入＝橙(同じく仕入金額欄と同じ系統)
+const num = n => n ? Number(n).toLocaleString() : "-";
+
+function MonthlyTrend({data}){
+  const currentFy = fiscalYearOf(today());
+  // 選べる年度 = データに出てくる年度 + 今期
+  const fyOptions = useMemo(()=>{
+    const s = new Set([currentFy]);
+    (data.transactions||[]).forEach(t=>{ if(t.transactionDate) s.add(fiscalYearOf(t.transactionDate)); });
+    return [...s].filter(y=>!isNaN(y)).sort((a,b)=>b-a);
+  },[data, currentFy]);
+  const [fy,setFy] = useState(currentFy);
+  const [mode,setMode] = useState("partner"); // partner(取引先別) / product(商品別)
+  const trend = useMemo(()=>buildMonthlyTrend(data, fy), [data, fy]);
+  const {months, total} = trend;
+  const sum = a => a.reduce((x,y)=>x+y,0);
+  const saleTotal = sum(total.sale), purchaseTotal = sum(total.purchase);
+  const monthLabel = m => `${Number(m.slice(5,7))}月`;
+
+  const partnerName = id => id ? ((data.partners||[]).find(p=>p.id===id)?.name || "(削除された取引先)") : "(未設定)";
+  const productName = id => id ? ((data.products||[]).find(p=>p.id===id)?.name || "(削除された商品)") : "(未設定)";
+  const nameOf = mode==="partner" ? partnerName : productName;
+
+  return (
+    <div className="card">
+      <div className="flex-between" style={{marginBottom:12,paddingBottom:6,borderBottom:"1px solid #EEE",flexWrap:"wrap",gap:8}}>
+        <h2 style={{border:"none",padding:0,margin:0}}>月別推移（売上・仕入）</h2>
+        <div className="flex" style={{gap:6}}>
+          <select value={fy} onChange={e=>setFy(Number(e.target.value))}>
+            {fyOptions.map(y=><option key={y} value={y}>{y}年度（{y}年6月〜{y+1}年5月）{y===currentFy?" ← 今期":""}</option>)}
+          </select>
+        </div>
+      </div>
+      <p style={{fontSize:11,color:"#666",marginBottom:10}}>
+        💡 取引日（受注日）の月で集計した税抜金額です。取消済の取引は含みません。輸出取引の売上は為替レートで円に換算しています。
+      </p>
+
+      <TrendChart months={months} sale={total.sale} purchase={total.purchase} monthLabel={monthLabel}/>
+
+      <div style={{overflowX:"auto",marginTop:12}}>
+        <table style={{fontSize:11,minWidth:900}}>
+          <thead><tr>
+            <th style={{whiteSpace:"nowrap"}}>（円）</th>
+            {months.map(m=><th key={m} className="text-right">{monthLabel(m)}</th>)}
+            <th className="text-right">年度合計</th>
+          </tr></thead>
+          <tbody>
+            <tr><td style={{color:TREND_SALE_COLOR,fontWeight:"bold"}}>売上</td>{total.sale.map((v,i)=><td key={i} className="text-right">{num(v)}</td>)}<td className="text-right" style={{fontWeight:"bold"}}>{num(saleTotal)}</td></tr>
+            <tr><td style={{color:TREND_PURCHASE_COLOR,fontWeight:"bold"}}>仕入</td>{total.purchase.map((v,i)=><td key={i} className="text-right">{num(v)}</td>)}<td className="text-right" style={{fontWeight:"bold"}}>{num(purchaseTotal)}</td></tr>
+            <tr><td style={{fontWeight:"bold"}}>粗利</td>{total.sale.map((v,i)=>{const g=v-total.purchase[i];return <td key={i} className={"text-right "+(g>=0?"profit":"loss")}>{g?g.toLocaleString():"-"}</td>;})}<td className={"text-right "+(saleTotal-purchaseTotal>=0?"profit":"loss")} style={{fontWeight:"bold"}}>{num(saleTotal-purchaseTotal)}</td></tr>
+            <tr><td>粗利率</td>{total.sale.map((v,i)=><td key={i} className="text-right">{v?((v-total.purchase[i])/v*100).toFixed(1)+"%":"-"}</td>)}<td className="text-right">{saleTotal?((saleTotal-purchaseTotal)/saleTotal*100).toFixed(1)+"%":"-"}</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div className="flex" style={{gap:6,margin:"18px 0 8px"}}>
+        <strong style={{fontSize:13,marginRight:6}}>売上順位</strong>
+        <button className={"btn btn-sm "+(mode==="partner"?"btn-primary":"btn-secondary")} onClick={()=>setMode("partner")}>取引先別</button>
+        <button className={"btn btn-sm "+(mode==="product"?"btn-primary":"btn-secondary")} onClick={()=>setMode("product")}>商品別</button>
+      </div>
+      <TrendRankTable title={mode==="partner"?"お客様別 売上":"商品別 売上"} nameHeader={mode==="partner"?"お客様":"商品"}
+        rowsMap={trend.saleBy[mode]} months={months} monthLabel={monthLabel} nameOf={nameOf} color={TREND_SALE_COLOR}/>
+      <TrendRankTable title={mode==="partner"?"仕入先別 仕入":"商品別 仕入"} nameHeader={mode==="partner"?"仕入先":"商品"}
+        rowsMap={trend.purchaseBy[mode]} months={months} monthLabel={monthLabel} nameOf={nameOf} color={TREND_PURCHASE_COLOR}/>
+    </div>
+  );
+}
+
+// ---- 月別の棒グラフ(売上と仕入を月ごとに並べる)。外部ライブラリを使わずSVGで描く。 ----
+function TrendChart({months, sale, purchase, monthLabel}){
+  const W=760, H=240, padL=64, padR=12, padT=14, padB=28;
+  const max = Math.max(1, ...sale, ...purchase);
+  // 目盛りをきりのいい数字にする(1,2,5 × 10^n)
+  const rawStep = max/4, pow = Math.pow(10, Math.floor(Math.log10(rawStep)));
+  const step = [1,2,5,10].map(k=>k*pow).find(v=>v>=rawStep);
+  const top = step*4;
+  const plotW = W-padL-padR, plotH = H-padT-padB;
+  const groupW = plotW/12, barW = Math.min(18, groupW*0.34);
+  const y = v => padT + plotH - (v/top)*plotH;
+  const yLabel = v => v>=10000 ? `${(v/10000).toLocaleString()}万` : v.toLocaleString();
+  return (
+    <div>
+      <div className="flex" style={{gap:14,fontSize:11,marginBottom:4}}>
+        <span><span style={{display:"inline-block",width:10,height:10,background:TREND_SALE_COLOR,marginRight:4,verticalAlign:"middle"}}></span>売上</span>
+        <span><span style={{display:"inline-block",width:10,height:10,background:TREND_PURCHASE_COLOR,marginRight:4,verticalAlign:"middle"}}></span>仕入</span>
+      </div>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height:"auto",display:"block"}} role="img" aria-label="月別の売上と仕入の推移">
+        {[0,1,2,3,4].map(k=>{const v=step*k; return <g key={k}>
+          <line x1={padL} x2={W-padR} y1={y(v)} y2={y(v)} stroke={k===0?"#999":"#E5E7EB"} strokeWidth="1"/>
+          <text x={padL-6} y={y(v)+4} textAnchor="end" fontSize="10" fill="#666">{yLabel(v)}</text>
+        </g>;})}
+        {months.map((m,i)=>{
+          const cx = padL + groupW*i + groupW/2;
+          return <g key={m}>
+            <rect x={cx-barW-1} y={y(sale[i])} width={barW} height={Math.max(0,padT+plotH-y(sale[i]))} fill={TREND_SALE_COLOR} rx="2">
+              <title>{`${m} 売上 ¥${sale[i].toLocaleString()}`}</title>
+            </rect>
+            <rect x={cx+1} y={y(purchase[i])} width={barW} height={Math.max(0,padT+plotH-y(purchase[i]))} fill={TREND_PURCHASE_COLOR} rx="2">
+              <title>{`${m} 仕入 ¥${purchase[i].toLocaleString()}`}</title>
+            </rect>
+            <text x={cx} y={H-10} textAnchor="middle" fontSize="11" fill="#444">{monthLabel(m)}</text>
+          </g>;
+        })}
+      </svg>
+    </div>
+  );
+}
+
+// ---- 年度合計の大きい順に並べた、月別の順位表。 ----
+function TrendRankTable({title, nameHeader, rowsMap, months, monthLabel, nameOf, color}){
+  const rows = Object.keys(rowsMap||{}).map(id=>({id, vals:rowsMap[id], total:rowsMap[id].reduce((a,b)=>a+b,0)}))
+    .filter(r=>r.total!==0)
+    .sort((a,b)=>b.total-a.total);
+  const grand = rows.reduce((a,r)=>a+r.total,0);
+  return (
+    <div style={{marginBottom:16}}>
+      <h3 style={{fontSize:13,margin:"6px 0",color}}>{title}（{rows.length}件）</h3>
+      <div style={{overflowX:"auto"}}>
+        <table style={{fontSize:11,minWidth:1000}}>
+          <thead><tr>
+            <th className="text-center" style={{width:44,whiteSpace:"nowrap"}}>順位</th>
+            <th style={{whiteSpace:"nowrap"}}>{nameHeader}</th>
+            {months.map(m=><th key={m} className="text-right">{monthLabel(m)}</th>)}
+            <th className="text-right">年度合計</th>
+            <th className="text-right">構成比</th>
+          </tr></thead>
+          <tbody>
+            {rows.map((r,i)=><tr key={r.id||"none"}>
+              <td className="text-center" style={{fontWeight:i<3?"bold":"normal"}}>{i+1}</td>
+              <td style={{whiteSpace:"nowrap"}}>{nameOf(r.id)}</td>
+              {r.vals.map((v,k)=><td key={k} className="text-right">{num(v)}</td>)}
+              <td className="text-right" style={{fontWeight:"bold"}}>{num(r.total)}</td>
+              <td className="text-right">{grand?(r.total/grand*100).toFixed(1)+"%":"-"}</td>
+            </tr>)}
+            {rows.length===0 && <tr><td colSpan={months.length+4} style={{color:"#888"}}>この年度のデータはありません</td></tr>}
+            {rows.length>0 && <tr style={{background:"#F5F7FA",fontWeight:"bold"}}>
+              <td></td><td>合計</td>
+              {months.map((m,k)=><td key={m} className="text-right">{num(rows.reduce((a,r)=>a+r.vals[k],0))}</td>)}
+              <td className="text-right">{num(grand)}</td><td className="text-right">100%</td>
+            </tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
 }
 
 // ================================================================
