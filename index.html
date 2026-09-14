@@ -161,7 +161,7 @@ const SCHEMA_VERSION = 13;
 
 // 画面ヘッダーに出すビルド版数。改修したら必ずここを更新すること。
 // 「更新版を開けているか」をブラウザのキャッシュに惑わされず確認するための目印。
-const BUILD_LABEL = "2026-09-13 版";
+const BUILD_LABEL = "2026-09-14 版";
 
 // 旧データ(v1)を新形式(v2/v3/v4/v5/v6/v7/v8)へ移行する。既存フィールドの欠損補完のみ行い、
 // 既にある値は絶対に上書きしない。v1→v8を1回のmigrateData()呼び出しで
@@ -1848,6 +1848,11 @@ function FreeeConfigModal({config, onSave, onClose}) {
       <div className="modal" style={{width:600}} onClick={e=>e.stopPropagation()}>
         <h3>freee連携設定</h3>
         <p style={{fontSize:12,color:"#666",marginBottom:12}}>freee APIで請求書を自動発行するための設定です。</p>
+        <div style={{background:"#E7F0FF",padding:10,borderRadius:4,marginBottom:10,fontSize:12,color:"#0B3D6B"}}>
+          <strong>2026年9月から、この画面の入力は使っていません。</strong><br/>
+          「請求書発行(freee)」は共有データベース(GAS)経由でfreeeに送ります。freeeとの接続は、共有データベースのスプレッドシートを開き、
+          メニュー「freee連携 &gt; セットアップ」で行ってください（アクセストークンをブラウザに入れる必要はありません）。
+        </div>
         <div className="form-row">
           <label>freee アクセストークン *</label>
           <input value={c.accessToken||""} onChange={e=>setC({...c,accessToken:e.target.value})} placeholder="freee for Developers から取得"/>
@@ -3475,8 +3480,10 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
   ).sort((a,b)=>String(b.issuedAt||"").localeCompare(String(a.issuedAt||"")));
 
   const openPreview = (customerId, g) => {
-    if (!freeeConfig?.accessToken || !freeeConfig?.companyId) {
-      if (confirm("freee設定が未登録です。設定画面を開きますか?")) onNeedConfig();
+    // freeeへの送信は共有DBのGAS経由(2026-09-14〜)。freeeとの接続(認可)はGAS側に保存されているので、
+    // ここで見るのは共有DBの接続設定だけ。freeeの設定は共有DBスプレッドシートの「freee連携」メニューで行う。
+    if (!backendConfig?.url || !backendConfig?.accessCode) {
+      alert("freeeへの送信には共有データベースの設定が必要です。\n設定タブでWeb App URLとアクセスコードを入力してください。\n（freeeとの接続は、共有データベースのスプレッドシートの「freee連携」メニューで設定します）");
       return;
     }
     const totalTax = Math.floor(g.tax8*0.08) + Math.floor(g.tax10*0.10);
@@ -3487,7 +3494,7 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
     if (!preview || sending) return;
     setSending(true);
     try {
-      await confirmFreeeIssue(freeeConfig, {customerId:preview.customerId, lines:preview.lines, month:selectedMonth});
+      await confirmFreeeIssue(backendConfig, {customerId:preview.customerId, lines:preview.lines, month:selectedMonth});
     } finally {
       setSending(false);
     }
@@ -3883,41 +3890,46 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
     const issueDate = lastDay.toISOString().slice(0,10);
     const dueDate = calcDueDate(customer, issueDate);
 
-    const body = {
-      company_id: Number(config.companyId),
-      issue_date: issueDate,
-      due_date: dueDate,
-      partner_id: Number(customer.freeePartnerId || 0) || null,
-      partner_code: customer.formalName || customer.name,
-      invoice_status: "issue",
-      title: target.month.replace("-","年")+"月分",
-      invoice_contents: invoiceItems
-    };
-    if (!body.partner_id && !body.partner_code) {
+    // 2026-09-14: freee会計の POST /api/1/invoices は廃止済み(404「不正なURLです」)。
+    // 共有DBのGAS(freee請求書連携.gs の freeeCreateInvoiceFromApp_)経由で freee請求書API POST /iv/invoices に送る。
+    // 取引先の特定は GAS側で「freee partner_id → 正式社名 → 名前」の順に freee の取引先マスタと照合する。
+    if (!customer.freeePartnerId && !customer.formalName && !customer.name) {
       alert("お客様のfreee partner_idまたは正式社名が必要です");
       return;
     }
-    if (!body.partner_id) delete body.partner_id;
-    else delete body.partner_code;
+    const gasLines = target.lines.map(line => {
+      const d0 = new Date(line.transactionDate);
+      const md = isNaN(d0) ? "" : (d0.getMonth()+1)+"/"+d0.getDate()+"納品 ";
+      return {
+        description: (md + (line.productName||"") + (line.sanchi ? " "+line.sanchi+"分" : "")).slice(0, 255),
+        quantity: Number(line.qty)||0,
+        unit: line.unit || "",
+        unitPrice: Number(line.unitPrice)||0,
+        // freee請求書APIの税率は 0/8/10。8%は軽減税率フラグと組み合わせる(農産物・食品)
+        taxRate: line.taxRate===0.08 ? 8 : 10,
+        reduced: line.taxRate===0.08,
+      };
+    });
 
     const invoiceId = newId("inv");
     const invoiceNo = genInvoiceNo(data.invoices, customer, target.month);
     const txIdsPreview = [...new Set(target.lines.map(l=>l.transactionId))];
 
     try {
-      const res = await fetch("https://api.freee.co.jp/api/1/invoices", {
-        method: "POST",
-        headers: {
-          "Authorization": "Bearer " + config.accessToken,
-          "Content-Type": "application/json",
-          "X-Api-Version": "2020-06-15"
-        },
-        body: JSON.stringify(body)
+      // appInvoiceNo を渡すと、GAS側で「同じ請求Noは2回作らない」。
+      // 通信が途中で切れて結果が分からなくても、もう一度押せば同じfreee請求書を返すだけで二重には作られない。
+      const j = await backendCall(config, {
+        action: "freeeCreateInvoice",
+        appInvoiceNo: invoiceNo,
+        billingDate: issueDate,
+        paymentDate: dueDate,
+        subject: target.month.replace("-","年")+"月分ご請求",
+        partner: {freeePartnerId: customer.freeePartnerId||"", formalName: customer.formalName||"", name: customer.name||""},
+        lines: gasLines,
       });
-      const j = await res.json();
-      if (!res.ok) {
-        const msg = JSON.stringify(j).substring(0,400);
-        alert("freee APIエラー: " + msg);
+      if (!j || !j.ok) {
+        const msg = String((j && j.error) || "共有データベースから応答がありません").substring(0,400);
+        alert("freeeへの送信に失敗しました（請求済みにはしていません）:\n" + msg);
         await update(d=>{
           d.freeeErrorLog = d.freeeErrorLog || [];
           d.freeeErrorLog.push({id:newId("err"), timestamp:new Date().toISOString(), customerId:target.customerId, month:target.month, error:msg, retryable:true});
@@ -3925,7 +3937,8 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
         });
         return;
       }
-      const freeeInvoiceId = j.invoice?.id;
+      const freeeInvoiceId = j.result && j.result.freeeInvoiceId;
+      const freeeReused = !!(j.result && j.result.reused);
       const now = new Date().toISOString();
       await update(d=>{
         // 二重請求防止の要: freee送信内容(target.lines)は請求書発行"内容"の記録用に使うが、
@@ -3986,10 +3999,15 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
         d = addAuditLog(d, {action:"invoice_issue", targetType:"invoice", targetId:invoiceId, before:null, after:{invoiceNo, customerId:target.customerId, txIds, total}});
         return d;
       });
-      alert("freeeに請求書を作成しました (請求No: "+invoiceNo+" / freee ID: "+freeeInvoiceId+")");
+      alert((freeeReused
+        ? "この請求Noはfreeeに作成済みだったので、作成済みの請求書を記録しました（二重には作っていません）。"
+        : "freeeに請求書を作成しました。")
+        + "\n\n請求No: "+invoiceNo+" / freee ID: "+freeeInvoiceId
+        + "\n\nfreee側で内容を確認してから、お客様へ送付してください。");
       setPreview(null);
     } catch(err) {
-      alert("接続エラー: "+err.message+"\n\nCORSブロックの可能性があります。GAS経由の代替案が必要かもしれません。");
+      alert("freeeへの送信中に接続エラーが起きました（請求済みにはしていません）:\n"+err.message
+        + "\n\nもう一度押しても、同じ請求Noの請求書がfreeeに二重に作られることはありません。");
       await update(d=>{
         d.freeeErrorLog = d.freeeErrorLog || [];
         d.freeeErrorLog.push({id:newId("err"), timestamp:new Date().toISOString(), customerId:target.customerId, month:target.month, error:String(err.message||err), retryable:true});
@@ -4247,7 +4265,7 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
       <div className="modal-bg" onClick={()=>!sending && setPreview(null)}>
         <div className="modal" style={{width:700}} onClick={e=>e.stopPropagation()}>
           <h3>請求内容の最終確認 (freee発行前プレビュー)</h3>
-          <p style={{fontSize:12,color:"#666",marginBottom:10}}>以下の内容でfreeeに請求書を発行します。発行後は該当数量が「請求済」となり、その取引の全数量を請求し終えた取引のみ編集・削除できなくなります。</p>
+          <p style={{fontSize:12,color:"#666",marginBottom:10}}>以下の内容でfreeeに請求書を作成します（共有データベース経由）。freeeで作成に成功したときだけ該当数量が「請求済」となり、その取引の全数量を請求し終えた取引のみ編集・削除できなくなります。作成後はfreee側で内容を確認してからお客様へ送付してください。</p>
           <div className="summary-box" style={{gridTemplateColumns:"repeat(3,1fr)"}}>
             <div className="item"><div className="lbl">対象件数</div><div className="val">{preview.lines.length}明細</div></div>
             <div className="item"><div className="lbl">税抜合計</div><div className="val">{yen(preview.total)}</div></div>
