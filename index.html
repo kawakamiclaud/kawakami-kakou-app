@@ -161,7 +161,7 @@ const SCHEMA_VERSION = 13;
 
 // 画面ヘッダーに出すビルド版数。改修したら必ずここを更新すること。
 // 「更新版を開けているか」をブラウザのキャッシュに惑わされず確認するための目印。
-const BUILD_LABEL = "2026-10-01b 版";
+const BUILD_LABEL = "2026-10-01c 版";
 
 // 旧データ(v1)を新形式(v2/v3/v4/v5/v6/v7/v8)へ移行する。既存フィールドの欠損補完のみ行い、
 // 既にある値は絶対に上書きしない。v1→v8を1回のmigrateData()呼び出しで
@@ -603,13 +603,31 @@ function invoiceBasisDate(t, basis) {
 }
 
 // ---- 請求書番号採番: INV-YYYYMM-取引先コード-連番 ----
-function genInvoiceNo(invoices, customer, targetMonth) {
-  const ym = targetMonth.replace("-","");
+// 番号の頭(お客様と対象月で決まる部分)
+function invoiceNoPrefix(customer, targetMonth) {
+  const ym = String(targetMonth||"").replace("-","");
   const code = (customer?.id || "XXXX").replace(/[^a-zA-Z0-9]/g,"").slice(-4).toUpperCase() || "XXXX";
-  const prefix = `INV-${ym}-${code}-`;
-  const existing = (invoices||[]).filter(i => i.invoiceNo && i.invoiceNo.startsWith(prefix));
-  const seq = existing.length + 1;
+  return `INV-${ym}-${code}-`;
+}
+// このパソコンが知っている、その頭で始まる請求Noの最大の連番
+function localMaxInvoiceSeq(invoices, prefix) {
+  let max = 0;
+  (invoices||[]).forEach(i => {
+    if (!i.invoiceNo || !i.invoiceNo.startsWith(prefix)) return;
+    const n = parseInt(i.invoiceNo.slice(prefix.length), 10);
+    if (!isNaN(n) && n > max) max = n;
+  });
+  return max;
+}
+function invoiceNoOf(prefix, seq) {
   return `${prefix}${String(seq).padStart(3,"0")}`;
+}
+// このパソコンだけで番号を決める従来の方法。
+// 共有データベースにつながらないときの予備として残してある(本番の採番は reserveInvoiceNo)。
+// 件数ではなく最大番号から数えるので、過去の請求書を消しても番号が重複しない。
+function genInvoiceNo(invoices, customer, targetMonth) {
+  const prefix = invoiceNoPrefix(customer, targetMonth);
+  return invoiceNoOf(prefix, localMaxInvoiceSeq(invoices, prefix) + 1);
 }
 
 // ---- 操作ログ追加(dataを直接書き換えて返す) ----
@@ -1329,6 +1347,43 @@ async function backendPushBatch(config, entity, records){
 async function backendDelete(config, entity, id){
   try { const r = await backendCall(config, {action:"delete", entity, id}); return !!(r && r.ok); }
   catch(e) { console.warn("backend delete failed", entity, e); return false; }
+}
+// 請求Noを共有データベース側(GAS)で1つ取る。2台のパソコンで同時に発行しても番号が重ならない。
+// 戻り値: {ok:true, invoiceNo} / {ok:false, reason:"offline"|"oldBackend"|"error", error}
+async function backendReserveInvoiceNo(config, prefix, localMax){
+  let r;
+  try {
+    r = await backendCall(config, {action:"reserveInvoiceNo", prefix, localMax});
+  } catch(e) {
+    console.warn("backend reserveInvoiceNo failed", e);
+    return {ok:false, reason:"offline", error:String(e && e.message || e)};
+  }
+  if (r && r.ok && r.result && r.result.invoiceNo) return {ok:true, invoiceNo:r.result.invoiceNo, seq:r.result.seq};
+  const msg = String((r && r.error) || "共有データベースから応答がありません");
+  // 共有DB側のコード差し替え(デプロイ)がまだの場合はこのactionを知らない
+  return {ok:false, reason: /不明なaction/.test(msg) ? "oldBackend" : "error", error: msg};
+}
+// 請求Noを決める。原則は共有データベースでの採番。
+// つながらないときだけ、確認を取ってからこのパソコンだけで決める(従来の方法)。
+// 戻り値: 請求No(文字列) / 利用者が中止したら null
+async function decideInvoiceNo(config, invoices, customer, targetMonth){
+  const prefix = invoiceNoPrefix(customer, targetMonth);
+  const localMax = localMaxInvoiceSeq(invoices, prefix);
+  const fallbackNo = invoiceNoOf(prefix, localMax + 1);
+  if (!config?.url || !config?.accessCode) return fallbackNo;
+
+  const r = await backendReserveInvoiceNo(config, prefix, localMax);
+  if (r.ok) return r.invoiceNo;
+
+  const why = r.reason === "oldBackend"
+    ? "共有データベース側のプログラムがまだ新しい版になっていません。\n(Apps Scriptのコード差し替えと「デプロイを管理」からの新バージョン発行が必要です)"
+    : "共有データベースにつながりません。\n"+String(r.error||"").slice(0,200);
+  return confirm(
+    "⚠ 請求Noを共有データベースで採番できませんでした。\n\n"+why+"\n\n"+
+    "このまま進めると、このパソコンだけで番号を決めます（"+fallbackNo+"）。\n"+
+    "もし別のパソコンでも同じ月の請求書を発行していると、同じ請求Noが2回使われる可能性があります。\n\n"+
+    "このまま発行しますか？"
+  ) ? fallbackNo : null;
 }
 // 1エンティティ配列を比較し、新規追加または内容変化があったレコードだけを返す純粋関数(単体テスト用に分離)
 function diffEntityRecords(prevArr, nextArr){
@@ -3665,15 +3720,19 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
 
     const totalTax = Math.floor(g.tax8*0.08) + Math.floor(g.tax10*0.10);
     const total = g.total + totalTax;
-    const invoiceNo = genInvoiceNo(data.invoices, customer, selectedMonth);
+    const tentativeNo = genInvoiceNo(data.invoices, customer, selectedMonth);
     if (!confirm(
       `${customer.name} の ${selectedMonth}分 の請求書PDFを発行します。\n\n`+
-      `請求No: ${invoiceNo}\n請求金額(税込): ${yen(total)}\n\n`+
+      `請求No: ${tentativeNo}（確定番号は発行時に共有データベースで決まります）\n請求金額(税込): ${yen(total)}\n\n`+
       `発行すると、この分は「請求済み」になり、次回から請求対象から外れます。よろしいですか？`
     )) return;
 
     setIssuingPdf(true);
     try {
+      // 請求Noは共有データベース側で採番する(2台のパソコンで同じ番号を使わないため)
+      const invoiceNo = await decideInvoiceNo(backendConfig, data.invoices, customer, selectedMonth);
+      if (!invoiceNo) return;
+
       const lastDay = new Date(selectedMonth+"-01");
       lastDay.setMonth(lastDay.getMonth()+1);
       lastDay.setDate(0);
@@ -4072,7 +4131,9 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
     });
 
     const invoiceId = newId("inv");
-    const invoiceNo = genInvoiceNo(data.invoices, customer, target.month);
+    // 請求Noは共有データベース側で採番する(2台のパソコンで同じ番号を使わないため)
+    const invoiceNo = await decideInvoiceNo(config, data.invoices, customer, target.month);
+    if (!invoiceNo) return;
     const txIdsPreview = [...new Set(target.lines.map(l=>l.transactionId))];
 
     try {
