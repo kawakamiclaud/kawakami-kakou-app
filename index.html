@@ -161,7 +161,7 @@ const SCHEMA_VERSION = 13;
 
 // 画面ヘッダーに出すビルド版数。改修したら必ずここを更新すること。
 // 「更新版を開けているか」をブラウザのキャッシュに惑わされず確認するための目印。
-const BUILD_LABEL = "2026-09-14 版";
+const BUILD_LABEL = "2026-09-30 版";
 
 // 旧データ(v1)を新形式(v2/v3/v4/v5/v6/v7/v8)へ移行する。既存フィールドの欠損補完のみ行い、
 // 既にある値は絶対に上書きしない。v1→v8を1回のmigrateData()呼び出しで
@@ -2947,6 +2947,7 @@ function ShipmentEntryModal({transaction,data,update,onClose}){
 
   const [editingShipment,setEditingShipment] = useState(null); // null=新規, {..shipment}=編集中
   const [printDoc,setPrintDoc] = useState(null); // 納品書印刷対象のdocumentレコード
+  const [sendingDs,setSendingDs] = useState(""); // freeeへ納品書を送信中の出荷ID
   const [header,setHeader] = useState({
     shipmentDate: today(), plannedDeliveryDate: tx.plannedDeliveryDate||"", actualDeliveryDate:"",
     originBase: tx.sanchi||"熊本", deliveryDestinationId: tx.deliveryDestinationId||"",
@@ -3218,6 +3219,76 @@ function ShipmentEntryModal({transaction,data,update,onClose}){
     setPrintDoc(doc);
   };
 
+  // ---- freeeで納品書を作る(2026-09-30追加): 納品書印刷とまったく同じスナップショットを
+  // 共有DBのGAS(freee請求書連携.gs の freeeCreateDeliverySlipFromApp_)経由で
+  // freee請求書API POST /iv/delivery_slips に送る。紙の納品書とfreeeの納品書は必ず同じ内容になる。
+  // 出荷Noを二重作成防止のキーにしているので、通信が切れて結果が分からなくても押し直せば二重には作られない。
+  // 請求とは無関係。請求済み扱いには一切しない。 ----
+  const handleFreeeDeliverySlip = async (s) => {
+    const cfg = loadBackendConfig();
+    if (!cfg.enabled || !cfg.url || !cfg.accessCode) {
+      alert("freeeへの納品書作成には共有データベースの接続が必要です。\n設定タブで共有データベースを有効にしてから、もう一度お試しください。");
+      return;
+    }
+    const customer = (data.partners||[]).find(p=>p.id===tx.customerId);
+    if (!customer) { alert("お客様が見つかりません。"); return; }
+    if (!customer.freeePartnerId && !customer.formalName && !customer.name) {
+      alert("お客様のfreee partner_idまたは正式社名が必要です。取引先マスタを確認してください。");
+      return;
+    }
+    const {doc, isNew} = prepareDocument(data, {
+      documentType:"delivery_note", sourceId: s.id, documentNo: s.shipmentNo,
+      buildSnapshot: () => buildDeliveryNoteSnapshot(s, tx, data),
+    });
+    const snap = doc.snapshot || {};
+    const lines = (snap.items||[]).map(it=>({
+      description: String(it.productName||"").slice(0,255),
+      quantity: Number(it.qty)||0,
+      unit: it.unit||"",
+      unitPrice: Number(it.unitPrice)||0,
+      // freee請求書APIの税率は 0/8/10。8%は軽減税率フラグと組み合わせる(農産物・食品)
+      taxRate: it.taxRate===0.08 ? 8 : 10,
+      reduced: it.taxRate===0.08,
+    }));
+    if (lines.length===0) { alert("納品済の数量がないため、freeeに納品書を作れません。"); return; }
+    if (!confirm(`出荷 ${s.shipmentNo} の納品書を freee に作ります。よろしいですか？\n\n納品日: ${fmtDate(snap.deliveryDate)}\n品目: ${lines.length}件\n合計: ${yen(snap.total||0)}`)) return;
+
+    setSendingDs(s.id);
+    try {
+      const j = await backendCall(cfg, {
+        action: "freeeCreateDeliverySlip",
+        appDeliveryNo: s.shipmentNo,
+        deliveryDate: snap.deliveryDate,
+        subject: `取引 ${snap.sourceTransactionNo||tx.transactionNo||""}`.trim(),
+        note: snap.note||"",
+        partner: {freeePartnerId: customer.freeePartnerId||"", formalName: customer.formalName||"", name: customer.name||""},
+        lines,
+      });
+      if (!j || !j.ok) {
+        alert("freeeへの納品書作成に失敗しました:\n" + String((j&&j.error)||"共有データベースから応答がありません").substring(0,400));
+        return;
+      }
+      const r = j.result || {};
+      await update(d=>{
+        if (isNew) d = commitDocumentIssue(d, doc, `出荷${s.shipmentNo}`);
+        d.shipments = (d.shipments||[]).map(x=>x.id===s.id ? {...x,
+          freeeDeliverySlipId: r.freeeDeliverySlipId||"",
+          freeeDeliverySlipNo: r.deliverySlipNumber||"",
+          freeeDeliverySlipUrl: r.reportUrl||"",
+          freeeDeliverySlipSentAt: new Date().toISOString(),
+        } : x);
+        return d;
+      });
+      alert(r.reused
+        ? `この出荷の納品書は、すでに freee に作成済みです（納品書No: ${r.deliverySlipNumber||"-"}）。二重には作られていません。`
+        : `freeeに納品書を作成しました。\n納品書No: ${r.deliverySlipNumber||"(freee側で自動採番)"}`);
+    } catch (e) {
+      alert("freeeへの納品書作成でエラーが出ました:\n" + String((e&&e.message)||e).substring(0,400));
+    } finally {
+      setSendingDs("");
+    }
+  };
+
   const cancelShipment = (s) => {
     if (!confirm(`出荷 ${s.shipmentNo} を取消しますか？この出荷分の出荷/納品数量は取引明細から差し引かれます。`)) return;
     update(d=>{
@@ -3343,7 +3414,10 @@ function ShipmentEntryModal({transaction,data,update,onClose}){
                   const sumShip = (s.items||[]).reduce((a,x)=>a+(Number(x.shippedQty)||0),0);
                   const sumDeliv = (s.items||[]).reduce((a,x)=>a+(Number(x.deliveredQty)||0),0);
                   return <tr key={s.id}>
-                    <td>{s.shipmentNo}</td>
+                    <td>{s.shipmentNo}
+                      {s.freeeDeliverySlipId && <span className="badge badge-purple" style={{marginLeft:4}}
+                        title={`freee納品書No: ${s.freeeDeliverySlipNo||"-"}`}>freee納品書</span>}
+                    </td>
                     <td>{fmtDate(s.shipmentDate)}</td>
                     <td>{s.carrier||"-"}</td>
                     <td>{s.trackingNo||"-"}</td>
@@ -3358,6 +3432,8 @@ function ShipmentEntryModal({transaction,data,update,onClose}){
                       {s.status!=="cancelled" && <>
                         <button className="btn btn-secondary btn-sm" onClick={()=>startEdit(s)}>編集</button>
                         <button className="btn btn-secondary btn-sm" style={{marginLeft:4}} onClick={()=>handlePrintDeliveryNote(s)}>納品書印刷</button>
+                        <button className="btn btn-secondary btn-sm" style={{marginLeft:4}} disabled={sendingDs===s.id}
+                          onClick={()=>handleFreeeDeliverySlip(s)}>{sendingDs===s.id ? "送信中…" : "freeeで納品書"}</button>
                         <button className="btn btn-danger btn-sm" style={{marginLeft:4}} onClick={()=>cancelShipment(s)}>取消</button>
                       </>}
                     </td>
