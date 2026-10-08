@@ -161,7 +161,7 @@ const SCHEMA_VERSION = 13;
 
 // 画面ヘッダーに出すビルド版数。改修したら必ずここを更新すること。
 // 「更新版を開けているか」をブラウザのキャッシュに惑わされず確認するための目印。
-const BUILD_LABEL = "2026-10-01c 版";
+const BUILD_LABEL = "2026-10-03 版";
 
 // 旧データ(v1)を新形式(v2/v3/v4/v5/v6/v7/v8)へ移行する。既存フィールドの欠損補完のみ行い、
 // 既にある値は絶対に上書きしない。v1→v8を1回のmigrateData()呼び出しで
@@ -816,10 +816,11 @@ function buildInvoiceHtml({company, customer, invoiceNo, issueDate, dueDate, tar
     const sanchi = l.sanchi && !l.isFreightLine ? `　${l.sanchi}県産` : "";
     return `${md}${l.productName||""}${sanchi}${l.taxRate===0.08?" ※":""}`;
   };
+  // 列の順番は 摘要 → 単価 → 数量 → 明細金額(2026-10-03。画面の明細表と同じ並びに揃えた)
   const row = (l)=>`<tr>
     <td>${escapeHtml(tekiyo(l))}</td>
-    <td class="r nowrap">${escapeHtml(l.qty)}${l.unit?` ${escapeHtml(l.unit)}`:""}</td>
     <td class="r">${Number(l.unitPrice||0).toLocaleString()}</td>
+    <td class="r nowrap">${escapeHtml(l.qty)}${l.unit?` ${escapeHtml(l.unit)}`:""}</td>
     <td class="r">${Number(l.amount||0).toLocaleString()}</td>
   </tr>`;
   const sub8 = Number(subtotalByTaxRate["0.08"]||0), sub10 = Number(subtotalByTaxRate["0.10"]||0);
@@ -890,7 +891,7 @@ function buildInvoiceHtml({company, customer, invoiceNo, issueDate, dueDate, tar
 
   <h2 class="sec">内訳</h2>
   <table class="detail">
-    <thead><tr><th>摘要</th><th style="width:15%">数量</th><th style="width:15%">単価</th><th style="width:18%">明細金額</th></tr></thead>
+    <thead><tr><th>摘要</th><th style="width:15%">単価</th><th style="width:15%">数量</th><th style="width:18%">明細金額</th></tr></thead>
     <tbody>${lines.map(row).join("")}</tbody>
   </table>
 
@@ -3610,6 +3611,28 @@ function freightBillableLinesFor(t, partner, shipments) {
       };
     });
 }
+// ---- 請求明細の並び順: 産地ごとにまとめ、熊本 → 広島 → その他 の順に出す(2026-10-03) ----
+// 同じ請求先に熊本と広島が混ざっているとき、産地ごとにまとまっていた方が確認しやすいため。
+// 産地の書き方が「熊本」と「熊本県産」で混在しているので、頭に県名が来ているかだけを見る。
+// 運賃行にも取引の産地が入っているので、その産地のかたまりの中に並ぶ。
+const SANCHI_ORDER = ["熊本", "広島"];
+function sanchiRank(s) {
+  const v = String(s==null?"":s).trim();
+  for (let i=0;i<SANCHI_ORDER.length;i++) if (v.indexOf(SANCHI_ORDER[i])===0) return i;
+  return SANCHI_ORDER.length;
+}
+// 同じ産地の中は、これまでどおり取引日の古い順(同じ日なら取引No順)
+function bySanchiThenDate(a, b) {
+  const ra = sanchiRank(a.sanchi), rb = sanchiRank(b.sanchi);
+  if (ra !== rb) return ra - rb;
+  if (ra === SANCHI_ORDER.length) {           // どちらも熊本・広島以外のとき(「―」や未設定)
+    const c = String(a.sanchi||"").localeCompare(String(b.sanchi||""), "ja");
+    if (c) return c;
+  }
+  const da = String(a.transactionDate||""), db = String(b.transactionDate||"");
+  if (da !== db) return da < db ? -1 : 1;
+  return String(a.transactionNo||"").localeCompare(String(b.transactionNo||""));
+}
 function buildBillableLines(t, partner, products, shipments) {
   const billable = billableItemsFor(t, partner);
   const itemLines = billable.map(it => {
@@ -3631,6 +3654,7 @@ function buildBillableLines(t, partner, products, shipments) {
 
 function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
   const [issuingPdf,setIssuingPdf] = useState(false); // PDF発行の二重クリック防止
+  const [invOpen,setInvOpen] = useState({}); // 明細を開いている取引先(画面を開き直すと全部閉じた状態に戻る)
   const [selectedMonth,setSelectedMonth] = useState(new Date().toISOString().slice(0,7));
   const [customerFilter,setCustomerFilter] = useState("");
   const [sending,setSending] = useState(false); // 二重クリック防止
@@ -3674,6 +3698,9 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
       else byCust[t.customerId].tax10 += line.amount;
     });
   });
+  // 産地ごとにまとめて並べ替える(熊本 → 広島 → その他)。
+  // ここで並べた順が、画面・請求書PDF・freeeの請求書すべての明細の順になる。
+  Object.keys(byCust).forEach(id => byCust[id].lines.sort(bySanchiThenDate));
 
   // 同月・同客先で発行済(issued/reissued)のinvoice一覧(参考表示・取消用)
   // 取消済みの請求書も履歴として残して表示する(証憑の記録なので画面から消さない)。
@@ -4351,6 +4378,13 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
       </div>
       <p style={{fontSize:12,color:"#666",marginBottom:10}}>💡 対象は「納品済かつ未請求」の数量のみ(明細単位で判定)。取引先ごとの請求サイクル設定(全数納品後一括 / 分納ごと)と締め日設定に基づき、請求基準日(納品日/出荷日/検収日/取引日)が対象期間に入るものだけを集計します。「請求書発行」を押すとプレビュー確認の上、該当数量が請求済になります(取引全体が編集不可になるのは、その取引の全数量を請求し終えた時のみです)。</p>
       {Object.keys(byCust).length === 0 && <p style={{color:"#999",padding:20}}>対象期間に納品済(未請求)の数量がありません</p>}
+      {Object.keys(byCust).length > 0 && (
+        <div className="flex" style={{marginBottom:8,gap:6,alignItems:"center"}}>
+          <button className="btn btn-sm" onClick={()=>setInvOpen(Object.fromEntries(Object.keys(byCust).map(k=>[k,true])))}>すべて開く</button>
+          <button className="btn btn-sm" onClick={()=>setInvOpen({})}>すべて閉じる</button>
+          <span style={{fontSize:11,color:"#888"}}>取引先の名前を押すと、その1件だけ開け閉めできます</span>
+        </div>
+      )}
       {Object.keys(byCust).map(id=>{
         const c = data.partners.find(p=>p.id===id);
         const g = byCust[id];
@@ -4360,7 +4394,10 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
         return (
           <div key={id} style={{marginBottom:16,border:"1px solid #DDE6F0",borderRadius:6,padding:12}}>
             <div className="flex-between" style={{marginBottom:8}}>
-              <strong>{c?.name} ({c?.kind}) - {g.lines.length}明細 [請求基準: {({delivery:"納品日",shipping:"出荷日",inspection:"検収日",transaction:"取引日"})[c?.invoiceBasis||"delivery"]} / {cadenceLabel} / 期間: {c?.billingCadence==="perShipment"?"都度":`${start}〜${end}`}]</strong>
+              <strong style={{cursor:"pointer",userSelect:"none"}} title="押すと明細を開け閉めできます"
+                onClick={()=>setInvOpen(o=>({...o,[id]:!o[id]}))}>
+                <span style={{display:"inline-block",width:14,color:"#888"}}>{invOpen[id]?"▾":"▸"}</span>
+                {c?.name} ({c?.kind}) - {g.lines.length}明細 [請求基準: {({delivery:"納品日",shipping:"出荷日",inspection:"検収日",transaction:"取引日"})[c?.invoiceBasis||"delivery"]} / {cadenceLabel} / 期間: {c?.billingCadence==="perShipment"?"都度":`${start}〜${end}`}]</strong>
               <div className="flex">
                 <span className="price" style={{fontSize:14}}>税抜: {yen(g.total)}</span>
                 <span style={{fontSize:12,color:"#888"}}>消費税: ¥{totalTax.toLocaleString()}</span>
@@ -4371,19 +4408,22 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
                   onClick={()=>issueInvoicePdf(id, g)}>{issuingPdf?"PDF発行中...":"請求書PDF発行"}</button>
               </div>
             </div>
+            {invOpen[id] && (
             <table>
-              <thead><tr><th>取引日</th><th>取引No.</th><th>産地</th><th>品目</th><th className="text-right">請求数量</th><th className="text-right">請求金額</th></tr></thead>
+              <thead><tr><th>取引日</th><th>取引No.</th><th>産地</th><th>品目</th><th className="text-right">単価</th><th className="text-right">請求数量</th><th className="text-right">請求金額</th></tr></thead>
               <tbody>
                 {g.lines.map((line,i)=><tr key={i}>
                   <td>{fmtDate(line.transactionDate)}</td>
                   <td>{line.transactionNo}</td>
                   <td>{line.sanchi}</td>
                   <td style={{fontSize:11}}>{line.productName}</td>
+                  <td className="text-right">{yen(line.unitPrice)}</td>
                   <td className="text-right">{line.qty}{line.unit}</td>
                   <td className="text-right price">{yen(line.amount)}</td>
                 </tr>)}
               </tbody>
             </table>
+            )}
           </div>
         );
       })}
