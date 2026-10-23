@@ -664,6 +664,7 @@ const AUDIT_ACTION_LABELS = {
   shipment_cancel: "出荷取消",
   freee_cancel_confirm: "freee側取消確認",
   freee_cancel_failed: "freee取消失敗記録",
+  freee_cancel_keep: "freee側を残す",
   // ---- Phase D: 帳票(見積書/発注書/納品書)のスナップショット発行・再発行 ----
   document_issue: "帳票発行",
   document_reissue: "帳票再発行",
@@ -4555,6 +4556,36 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
     });
   };
 
+  // freee側の請求書を取り消さず、そのまま別の請求書として使い続ける場合の記録(2026-10-22追加)。
+  // 実例: アプリ内で取消した請求のfreee側の控えを、freeeで金額を直してお客様へ送付済みだった。
+  // この場合 freee側を消すわけにはいかないので、「取消確認済み」でも「取消失敗」でもない。
+  // 嘘の記録を残さないための3つ目の選択肢。
+  const keepFreeeInvoice = (invoice) => {
+    const no = prompt(
+      "freee側の請求書(freee ID: "+invoice.freeeInvoiceId+")は取り消さず、そのまま使い続けます。\n\n"
+      + "この請求書を、いまどの請求Noとして扱っていますか。\n"
+      + "freeeの社内メモに書いた請求Noを入れてください（分からなければ空のままでOK）。",
+      "");
+    if (no === null) return; // キャンセル
+    if (!confirm(
+      "freee ID: "+invoice.freeeInvoiceId+" は取り消さず、そのまま残すものとして記録します。\n"
+      + (no ? "いまの請求No: "+no+"\n" : "")
+      + "\nこの案内は一覧から消えます。freee側の請求書はそのままです。\n\nよろしいですか？"
+    )) return;
+    update(d=>{
+      const current = (d.invoices||[]).find(i=>i.id===invoice.id);
+      if (!current) return d;
+      if (current.freeeCancelStatus !== "pending_manual") { alert("この請求は既に処理済みです"); return d; }
+      const before = current;
+      const after = {...current, freeeCancelStatus:"kept_in_freee", freeeKeptAsInvoiceNo: no || "",
+        freeeKeptAt: new Date().toISOString(), freeeKeptBy: d.meta?.currentUserName||""};
+      d.invoices = (d.invoices||[]).map(i=>i.id===current.id?after:i);
+      d = addAuditLog(d, {action:"freee_cancel_keep", targetType:"invoice", targetId:current.id, before, after,
+        reason:"freee側の請求書は取り消さず、そのまま使い続ける" + (no ? "（いまの請求No: "+no+"）" : "")});
+      return d;
+    }, null, {waitForSync:true}).then(warnIfInvoiceNotSynced);
+  };
+
   return (<>
     <div className="card">
       <h2>月次請求プレビュー ({selectedMonth}分)</h2>
@@ -4625,7 +4656,7 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
         <h2 style={{color:"#B45309"}}>⚠ freee側手動取消待ち ({pendingManualInvoices.length}件)</h2>
         <p style={{fontSize:12,color:"#8B5A00",marginBottom:10}}>
           以下の請求はアプリ内で取消済みですが、freeeへ送信済みだったため、freee側の請求書は自動では取消されていません。
-          freeeにログインして該当の請求書を手動で取消(または削除)した後、「freee側で取消確認済みにする」を押してください。
+          freeeにログインして該当の請求書を手動で取消(または削除)した後、「freee側で取消確認済みにする」を押してください。<br/>freee側の請求書を<b>消さずにそのまま使い続ける</b>場合（金額を直してお客様へ送付済みのときなど）は、「freee側は取り消さない」を押してください。を押してください。
         </p>
         <table>
           <thead><tr><th>請求No.</th><th>お客様</th><th className="text-right">税込合計</th><th>freee ID</th><th>アプリ内取消日時</th><th></th></tr></thead>
@@ -4641,6 +4672,7 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
                 <td>
                   <button className="btn btn-primary btn-sm" onClick={()=>setFreeeConfirmTarget(inv)}>freee側で取消確認済みにする</button>
                   <button className="btn btn-danger btn-sm" style={{marginLeft:4}} onClick={()=>markFreeeCancelFailed(inv)}>取消失敗として記録</button>
+                  <button className="btn btn-sm" style={{marginLeft:4}} onClick={()=>keepFreeeInvoice(inv)}>freee側は取り消さない</button>
                 </td>
               </tr>;
             })}
