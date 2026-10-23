@@ -161,7 +161,7 @@ const SCHEMA_VERSION = 13;
 
 // 画面ヘッダーに出すビルド版数。改修したら必ずここを更新すること。
 // 「更新版を開けているか」をブラウザのキャッシュに惑わされず確認するための目印。
-const BUILD_LABEL = "2026-10-03 版";
+const BUILD_LABEL = "2026-10-23 版";
 
 // 旧データ(v1)を新形式(v2/v3/v4/v5/v6/v7/v8)へ移行する。既存フィールドの欠損補完のみ行い、
 // 既にある値は絶対に上書きしない。v1→v8を1回のmigrateData()呼び出しで
@@ -1404,21 +1404,41 @@ function diffMetaKeys(prevMeta, nextMeta){
   const pm = prevMeta||{}, nm = nextMeta||{};
   return Object.keys(nm).filter(k => JSON.stringify(pm[k]) !== JSON.stringify(nm[k]));
 }
-// prevData→nextDataの差分だけをバックエンドへpushする。呼び出し元でawaitせずfire-and-forgetする想定。
-// 失敗しても例外を投げない(ローカル保存は既に成功しているため、ユーザー操作を止めない)。
+// 送る順番。請求書を必ず先に送る(2026-10-22)。
+// 以前は BACKEND_ENTITIES の順(transactions → invoices)で送っていたため、途中で通信が失敗すると
+// 「取引の請求済みの印だけが共有DBに届き、請求書そのものは届かない」状態になった。
+// こうなるとその分は請求タブにも請求書一覧にも出てこなくなり、請求漏れになる。
+// 請求書が先に届いていれば、最悪でも「請求書はあるが印が付いていない」で済み、こちらは発行し直せば直る。
+const BACKEND_PUSH_ORDER = ["invoices"].concat(BACKEND_ENTITIES.filter(e => e !== "invoices"));
+
+// prevData→nextDataの差分だけをバックエンドへpushする。
+// 失敗しても例外は投げないが、**失敗した分を配列で返す**(2026-10-22)。
+// 以前は戻り値が無く、呼び出し元も console.warn するだけだったため、
+// 共有DBへ届かなかったことに誰も気づけなかった。
 async function pushDiffToBackend(config, prevData, nextData){
-  if (!config || !config.enabled || !config.url) return;
-  for (const entity of BACKEND_ENTITIES) {
+  const failed = [];
+  if (!config || !config.enabled || !config.url) return failed;
+  for (const entity of BACKEND_PUSH_ORDER) {
     const prevArr = prevData && prevData[entity], nextArr = nextData && nextData[entity];
     const changed = diffEntityRecords(prevArr, nextArr);
-    for (const rec of changed) { await backendPush(config, entity, rec); }
+    for (const rec of changed) {
+      const ok = await backendPush(config, entity, rec);
+      if (!ok) failed.push({entity, id: rec.id, kind: "保存"});
+    }
     // 物理削除(配列から丸ごと消えたレコード)もスプレッドシート側から削除する。
     // これをしないと、削除したはずのレコードが次回pull時にサーバー側の残存データで復活してしまう。
     const removedIds = diffRemovedIds(prevArr, nextArr);
-    for (const id of removedIds) { await backendDelete(config, entity, id); }
+    for (const id of removedIds) {
+      const ok = await backendDelete(config, entity, id);
+      if (!ok) failed.push({entity, id, kind: "削除"});
+    }
   }
   const changedMetaKeys = diffMetaKeys(prevData && prevData.meta, nextData && nextData.meta);
-  for (const k of changedMetaKeys) { await backendPushMeta(config, k, nextData.meta[k]); }
+  for (const k of changedMetaKeys) {
+    const ok = await backendPushMeta(config, k, nextData.meta[k]);
+    if (!ok) failed.push({entity: "meta", id: k, kind: "保存"});
+  }
+  return failed;
 }
 
 // ================================================================
@@ -1622,6 +1642,8 @@ function App(){
   const [showDataMenu,setShowDataMenu] = useState(false);
   const [backendConfig,setBackendConfigState] = useState(loadBackendConfig());
   const [lastSyncTime,setLastSyncTime] = useState(null);
+  // 共有データベースへ送れなかった分。届いていないことに気づけるよう画面上部に出す(2026-10-22)
+  const [pushFailure,setPushFailure] = useState(null);
 
   // 旧データ形式(orders/procurements)を新形式(transactions)へマイグレーション
   useEffect(()=>{
@@ -1664,7 +1686,10 @@ function App(){
   const updateSeqRef = React.useRef(0);
 
   // fn(data)=>newData を実行して保存する。第2引数logMetaを渡すと監査ログ(auditLog)に自動記録する。
-  const update = async (fn, logMeta) => {
+  // opts.waitForSync: 共有データベースへ送り終わるまで待ち、失敗した分を配列で返す(2026-10-22)。
+  // 請求書の発行・取消のように「届かないと記録が食い違う」操作だけがこれを使う。
+  // それ以外は従来どおり、送信を待たずに画面を進める。
+  const update = async (fn, logMeta, opts) => {
     updateSeqRef.current++;
     // fnはd.products.push(...)のように配列を直接mutateすることがあるため、{...data}の浅いコピーでは
     // prevDataがfn実行後の内容と同じ配列を参照してしまう(=差分検出が常に「変更なし」になる)。
@@ -1675,12 +1700,46 @@ function App(){
     saveData(nd);setData(nd);
     if (syncHandle){const ok=await writeSyncFile(syncHandle,nd);showToast(ok?"自動同期保存":"同期失敗");}
     else {showToast("保存しました");}
-    // 共有データベースが有効なら差分だけ非同期でpushする(fire-and-forget。失敗してもローカル保存は既に成功済み)
-    if (backendConfig.enabled && backendConfig.url) {
-      pushDiffToBackend(backendConfig, prevData, nd)
-        .then(()=>setLastSyncTime(new Date()))
-        .catch(e=>console.warn("backend push failed", e));
+    // 共有データベースが有効なら差分をpushする。
+    if (!(backendConfig.enabled && backendConfig.url)) return [];
+    const done = (failed) => {
+      setLastSyncTime(new Date());
+      // 送り直せるよう、このときの前後のデータも一緒に覚えておく
+      setPushFailure(failed && failed.length
+        ? {at:new Date(), items:failed, prev:prevData, next:JSON.parse(JSON.stringify(nd))}
+        : null);
+      return failed || [];
+    };
+    if (opts && opts.waitForSync) {
+      try { return done(await pushDiffToBackend(backendConfig, prevData, nd)); }
+      catch(e) {
+        console.warn("backend push failed", e);
+        return done([{entity:"不明", id:"", kind:"通信", error:String(e && e.message || e)}]);
+      }
     }
+    pushDiffToBackend(backendConfig, prevData, nd)
+      .then(done)
+      .catch(e=>{ console.warn("backend push failed", e);
+        done([{entity:"不明", id:"", kind:"通信", error:String(e && e.message || e)}]); });
+    return [];
+  };
+
+  // 届かなかった分を、そのときの差分のまま送り直す(2026-10-22)。
+  // backendPushは上書き保存なので、同じものを二度送っても害はない。
+  const retryPush = async () => {
+    if (!pushFailure || !backendConfig.enabled || !backendConfig.url) return;
+    showToast("共有データベースへ送っています…");
+    try {
+      const failed = await pushDiffToBackend(backendConfig, pushFailure.prev, pushFailure.next);
+      if (failed.length) {
+        setPushFailure({...pushFailure, at:new Date(), items:failed});
+        showToast("まだ "+failed.length+" 件送れていません");
+      } else {
+        setPushFailure(null);
+        setLastSyncTime(new Date());
+        showToast("共有データベースに保存しました");
+      }
+    } catch(e) { showToast("送信に失敗しました"); }
   };
 
   const saveBackendConfig = (c) => {
@@ -1874,6 +1933,27 @@ function App(){
       ))}
     </nav>
     <main>
+      {/* 共有データベースへ届かなかった分の警告(2026-10-22)。
+          以前はコンソールに出すだけだったため、請求書が共有DBに届いていないことに誰も気づけず、
+          「取引は請求済みなのに請求書が無い」状態が実際に起きた。 */}
+      {pushFailure && (
+        <div className="card" style={{background:"#FFF1F0",border:"1px solid #E57373",marginBottom:12}}>
+          <h2 style={{color:"#C62828",marginTop:0}}>⚠ 共有データベースに保存できていない分があります</h2>
+          <p style={{fontSize:12,marginBottom:6}}>
+            {pushFailure.at.toLocaleString("ja-JP")} の保存で {pushFailure.items.length} 件が届きませんでした（
+            {[...new Set(pushFailure.items.map(f=>BACKEND_ENTITY_LABELS[f.entity]||f.entity))].join("、")}）。
+            <b>このパソコンには保存されていますが、他のパソコンにはまだ反映されていません。</b>
+          </p>
+          <p style={{fontSize:12,marginBottom:8}}>
+            ネットワークがつながっていることを確かめてから、下の「もう一度送る」を押してください。
+            押さずに画面を閉じると、この変更は他のパソコンに伝わりません。
+          </p>
+          <div className="flex">
+            <button className="btn btn-primary btn-sm" onClick={retryPush}>もう一度送る</button>
+            <button className="btn btn-sm" onClick={()=>setPushFailure(null)}>閉じる</button>
+          </div>
+        </div>
+      )}
       {tab==="dashboard" && <Dashboard data={data}/>}
       {tab==="quotations" && <QuotationsTab data={data} update={update}/>}
       {tab==="transactions" && <TransactionsTab data={data} update={update}/>}
@@ -3633,6 +3713,75 @@ function bySanchiThenDate(a, b) {
   if (da !== db) return da < db ? -1 : 1;
   return String(a.transactionNo||"").localeCompare(String(b.transactionNo||""));
 }
+// ---- 請求済み数量を、有効な請求書の内容に揃え直す(2026-10-22追加) ----
+// 「その取引が請求済みかどうか」の唯一の正しい根拠は、取消されていない請求書が実際に請求した数量。
+// 共有データベースへの保存が途中で失敗すると、取引側の「請求済み」の印だけが残り、
+// 請求書が無い（または取消済み）のに請求タブにも請求書一覧にも出てこない状態になる。
+// 実際にナチュラルフュージョンの2026年9月分で、180c/s のうち 90c/s がこの状態で止まった。
+// targetTxIds を渡すとその取引だけ、null なら全部を揃え直す。変更した取引Noの一覧を返す。
+// 明細内訳(items)を持たない古い請求書が請求している取引は、正しい数量が分からないので触らない。
+function reconcileInvoicedQty(d, targetTxIds) {
+  const claimQty = {};      // 明細ID -> 有効な請求書が請求した数量の合計
+  const claimInv = {};      // 取引ID -> その取引を請求している有効な請求書
+  const claimFreight = {};  // 出荷ID -> 運賃を請求している有効な請求書がある
+  const legacyTx = new Set();
+  (d.invoices||[]).forEach(i=>{
+    if (i.status === "cancelled") return;
+    const items = i.items || [];
+    if (items.length === 0) { (i.txIds||[]).forEach(id=>legacyTx.add(id)); return; }
+    items.forEach(li=>{
+      if (li.transactionId) claimInv[li.transactionId] = i;
+      if (li.isFreight && li.shipmentId) { claimFreight[li.shipmentId] = true; return; }
+      if (!li.transactionItemId) return;
+      claimQty[li.transactionItemId] = (claimQty[li.transactionItemId]||0) + Number(li.billedQty||0);
+    });
+  });
+
+  const changed = [];
+  d.transactions = (d.transactions||[]).map(t=>{
+    if (targetTxIds && !targetTxIds.has(t.id)) return t;
+    if (legacyTx.has(t.id)) return t;
+    const items = (t.items||[]).map(it=>{
+      const want = Number(claimQty[it.id]||0);
+      return Number(it.invoicedQty||0) === want ? it : {...it, invoicedQty: want};
+    });
+    const newTx = {...t, items};
+    newTx.status = computeTxStatus(newTx);
+    if (newTx.status === "invoiced") {
+      const ci = claimInv[t.id];
+      if (ci) { newTx.invoiceId = ci.id; newTx.invoiceNo = ci.invoiceNo; newTx.invoicedYearMonth = ci.targetMonth; }
+    } else if (t.invoiceId || t.invoiceNo || t.invoicedAt || t.invoicedYearMonth || t.invoicedDate) {
+      // 請求済みの印が付いているときだけ外す。
+      // 無条件に null を入れると、もともと印の無い取引まで「変更あり」と見なされて
+      // 共有データベースへ無駄に送られてしまうため。
+      newTx.invoiceId = null; newTx.invoiceNo = null; newTx.invoicedAt = null;
+      newTx.invoicedYearMonth = null; newTx.invoicedDate = null;
+    }
+    if (JSON.stringify(newTx) !== JSON.stringify(t)) changed.push(t.transactionNo || t.id);
+    return newTx;
+  });
+
+  // 運賃の請求済みの印も同じ考え方で揃える(取消したのに運賃だけ再請求できない、を防ぐ)
+  d.shipments = (d.shipments||[]).map(s=>{
+    if (targetTxIds && !targetTxIds.has(s.transactionId)) return s;
+    if (legacyTx.has(s.transactionId)) return s;
+    if (s.freightInvoicedAt && !claimFreight[s.id]) return {...s, freightInvoicedAt: null};
+    return s;
+  });
+  return changed;
+}
+
+// 「請求済みの印が残っているのに、請求書が無い／取消済み」の取引を探す(2026-10-22追加)
+function findBrokenBilledTxs(data, month) {
+  const byId = new Map((data.invoices||[]).map(i=>[i.id, i]));
+  return (data.transactions||[]).filter(t=>{
+    if (!t.invoiceId || !t.invoiceNo) return false;
+    if (month && t.invoicedYearMonth !== month) return false;
+    const inv = byId.get(t.invoiceId);
+    return !inv || inv.status === "cancelled";
+  });
+}
+
 function buildBillableLines(t, partner, products, shipments) {
   const billable = billableItemsFor(t, partner);
   const itemLines = billable.map(it => {
@@ -3832,7 +3981,7 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
         d = addAuditLog(d, {action:"invoice_issue", targetType:"invoice", targetId:invoiceId, before:null,
           after:{invoiceNo, customerId, txIds, total, issueMethod:"pdf", pdfUrl:saved.url}});
         return d;
-      });
+      }, null, {waitForSync:true}).then(warnIfInvoiceNotSynced);
       if (confirm(`請求書PDFを保存しました。\n\n請求No: ${invoiceNo}\nファイル: ${saved.name}\n保存先: 請求書PDF / ${saved.folder}\n\nドライブで開きますか？`)) {
         window.open(saved.url, "_blank");
       }
@@ -3960,6 +4109,54 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
   // useMemoにしないこと。update()はd.invoicesを直接pushして更新するため配列の参照が変わらず、
   // 依存配列に data.invoices を入れても再計算されず、復元後も案内が消え続ける。
   // 件数も小さいので毎回計算して構わない。
+  // 請求書が共有データベースに届かなかったときは、必ず画面で知らせる(2026-10-22追加)。
+  // 届いていないと、他のパソコンでは「取引は請求済みなのに請求書が無い」状態になり請求漏れになる。
+  const warnIfInvoiceNotSynced = (failed) => {
+    if (!failed || !failed.length) return;
+    const n = failed.filter(f=>f.entity==="invoices").length;
+    alert("⚠ 共有データベースに保存できませんでした。\n\n"
+      + "このパソコンには残っていますが、他のパソコンにはまだ反映されていません。\n"
+      + "画面の上に出ている赤い案内の「もう一度送る」を押してください。\n\n"
+      + "送れていない件数: " + failed.length + "件"
+      + (n ? "（うち請求書 " + n + "件）" : ""));
+  };
+
+  // 「請求済みの印が残っているのに、請求書が無い／取消済み」の取引(2026-10-22追加)。
+  // useMemoにしないこと(update()がd.invoicesを直接pushするため参照が変わらず再計算されない)。
+  const brokenBilled = findBrokenBilledTxs(data, selectedMonth);
+
+  const repairBrokenBilled = () => {
+    if (brokenBilled.length === 0) return;
+    const byId = new Map((data.invoices||[]).map(i=>[i.id, i]));
+    const lines = brokenBilled.map(t=>{
+      const inv = byId.get(t.invoiceId);
+      const c = data.partners.find(p=>p.id===t.customerId);
+      const q = (t.items||[]).reduce((a,it)=>a+Number(it.invoicedQty||0), 0);
+      return `・${t.transactionNo}（${c?.name||"?"}） ${q}${t.items?.[0]?.unit||""} … ${t.invoiceNo} は`
+        + (inv ? "取消済み" : "一覧にありません");
+    }).join("\n");
+    if (!confirm(
+      `請求済みの印が残っているのに、その請求書が無い（または取消済み）の取引が ${brokenBilled.length} 件あります。\n\n`
+      + lines + "\n\n"
+      + "これらを未請求に戻して、もう一度請求できる状態にします。\n"
+      + "有効な請求書で請求済みの分は、そのまま残ります。\n\n"
+      + "⚠ freee側に請求書が残っている場合は、先にfreeeの状態を確かめてください。\n\n"
+      + "戻しますか？"
+    )) return;
+
+    update(d=>{
+      const ids = new Set(brokenBilled.map(t=>t.id));
+      const changed = reconcileInvoicedQty(d, ids);
+      d = addAuditLog(d, {action:"update", targetType:"transaction", targetId:null,
+        before:null, after:{戻した取引:changed},
+        reason:"請求書が無い／取消済みなのに請求済みだった取引を未請求に戻した"});
+      return d;
+    }, null, {waitForSync:true}).then(failed=>{
+      warnIfInvoiceNotSynced(failed);
+      if (!failed || !failed.length) alert("未請求に戻しました。請求タブに出てくるか確かめてください。");
+    });
+  };
+
   const orphanInvoices = (()=>{
     const existing = new Set((data.invoices||[]).map(i=>i.id));
     const groups = {};
@@ -4246,7 +4443,7 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
         });
         d = addAuditLog(d, {action:"invoice_issue", targetType:"invoice", targetId:invoiceId, before:null, after:{invoiceNo, customerId:target.customerId, txIds, total}});
         return d;
-      });
+      }, null, {waitForSync:true}).then(warnIfInvoiceNotSynced);
       alert((freeeReused
         ? "この請求Noはfreeeに作成済みだったので、作成済みの請求書を記録しました（二重には作っていません）。"
         : "freeeに請求書を作成しました。")
@@ -4295,34 +4492,28 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
       // 旧仕様(v3以前に発行された、明細内訳items[]を持たない請求)を取消す場合は、後方互換として
       // 従来通りtxを丸ごとdeliveredへ戻す(invoicedQtyの精緻な巻き戻しはできないため保守的に据え置く)。
       const lineItems = current.items || [];
-      d.transactions = (d.transactions||[]).map(t=>{
-        if (!current.txIds.includes(t.id)) return t;
-        if (lineItems.length === 0) {
-          // 旧仕様の請求(明細内訳なし): 全体をdeliveredへ戻す
-          return {...t, status:"delivered", invoiceId:null, invoiceNo:null, invoicedAt:null};
-        }
-        const mine = lineItems.filter(li=>li.transactionId===t.id);
-        if (mine.length===0) return t;
-        const items = t.items.map(it=>{
-          const li = mine.find(x=>x.transactionItemId===it.id);
-          if (!li) return it;
-          return {...it, invoicedQty: Math.max(0, Number(it.invoicedQty||0) - Number(li.billedQty||0))};
-        });
-        const newTx = {...t, items};
-        newTx.status = computeTxStatus(newTx);
-        if (newTx.status !== "invoiced") { newTx.invoiceId = null; newTx.invoiceNo = null; newTx.invoicedAt = null; }
-        return newTx;
-      });
-      // 運賃を載せた請求を取消した場合、出荷側の請求済みの印を外して再請求できる状態に戻す。
-      // これをしないと、取消したのに運賃だけ二度と請求できなくなる。
-      const freightIds = lineItems.filter(li=>li.isFreight && li.shipmentId).map(li=>li.shipmentId);
-      if (freightIds.length) {
-        d.shipments = (d.shipments||[]).map(s =>
-          freightIds.includes(s.id) ? {...s, freightInvoicedAt: null} : s);
+      if (lineItems.length === 0) {
+        // 旧仕様の請求(明細内訳なし): 正しい数量が分からないので、従来どおり全体をdeliveredへ戻す
+        d.transactions = (d.transactions||[]).map(t=>
+          current.txIds.includes(t.id)
+            ? {...t, status:"delivered", invoiceId:null, invoiceNo:null, invoicedAt:null}
+            : t);
+      } else {
+        // 2026-10-22: 以前はこの請求書の txIds に載っている取引だけを戻していたため、
+        // 記録が食い違って「取引側だけがこの請求書を指している」分を取りこぼし、
+        // 取消したのに請求済みのまま残っていた(ナチュラルフュージョン2026年9月で実際に発生)。
+        // いまは「txIdsに載っている取引」と「この請求書を指している取引」の両方を対象にし、
+        // 請求済み数量は有効な請求書の内容から計算し直す。
+        const affected = new Set(current.txIds || []);
+        (d.transactions||[]).forEach(t=>{ if (t.invoiceId === current.id) affected.add(t.id); });
+        // 運賃を載せた請求を取消した場合、出荷側の請求済みの印も外して再請求できる状態に戻す。
+        // これをしないと、取消したのに運賃だけ二度と請求できなくなる。
+        (d.shipments||[]).forEach(s=>{ if (affected.has(s.transactionId)) affected.add(s.transactionId); });
+        reconcileInvoicedQty(d, affected);
       }
       d = addAuditLog(d, {action:"invoice_cancel", targetType:"invoice", targetId:current.id, before, after, reason});
       return d;
-    });
+    }, null, {waitForSync:true}).then(warnIfInvoiceNotSynced);
     setCancelling(false);
     setCancelTarget(null);
   };
@@ -4479,6 +4670,19 @@ function InvoicingTab({data,update,freeeConfig,backendConfig,onNeedConfig}){
             取引側には請求済みとして残っているため、一覧に履歴として戻せます。
           </div>
           <button className="btn btn-primary btn-sm" onClick={restoreOrphanInvoices}>失われた請求書を復元する</button>
+        </div>
+      )}
+      {/* 請求済みの印だけが残ってしまった取引の案内(2026-10-22追加)。
+          共有データベースへの保存が途中で失敗すると、この状態になって請求漏れになる。 */}
+      {brokenBilled.length>0 && (
+        <div style={{background:"#FFF1F0",border:"1px solid #E57373",padding:10,borderRadius:4,marginBottom:10}}>
+          <div style={{fontSize:12,marginBottom:6}}>
+            ⚠ <strong>請求済みになっているのに、その請求書が無い（または取消済み）</strong>の取引が
+            <strong> {brokenBilled.length}件</strong> あります
+            （{[...new Set(brokenBilled.map(t=>t.invoiceNo))].join("、")}）。
+            このままだと請求タブにも請求書一覧にも出てこないため、<strong>請求漏れになります。</strong>
+          </div>
+          <button className="btn btn-primary btn-sm" onClick={repairBrokenBilled}>未請求に戻す</button>
         </div>
       )}
       {monthInvoices.length===0 && <p style={{color:"#999",padding:10}}>この月の発行済請求書はありません</p>}
